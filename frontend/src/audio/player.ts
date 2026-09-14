@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 import type { StreamFormat } from './decoder'
+/* Imported as a URL rather than kept in public/ so Vite fingerprints it.
+ *
+ * A worklet under a fixed name is a protocol with no version: the page and the
+ * audio thread exchange messages, and a browser that keeps the old file from
+ * cache pairs a new page with an old worklet. Unknown messages are ignored —
+ * silently, since there is nothing else a processor can do with them — so the
+ * only symptom is a control that does nothing. */
+import workletUrl from './player-worklet.js?url'
 
 /** The playback buffer's own view of the world, reported from the audio thread. */
 export interface PlayerStatus {
@@ -50,6 +58,8 @@ export class Player {
   private node: AudioWorkletNode | null = null
   private status: PlayerStatus = { ...IDLE_STATUS }
   private listeners = new Set<(status: PlayerStatus) => void>()
+  /** Set once the running worklet is found to be older than this page. */
+  private staleWorkletReported = false
 
   /** True once the audio graph is running. */
   get running(): boolean {
@@ -97,11 +107,10 @@ export class Player {
       )
     }
 
-    // The worklet is served as a plain file from the site root, not bundled,
-    // so it is resolved against the document rather than against this module.
-    // That keeps it working whether the page is served from a domain root or
-    // from a subpath.
-    await context.audioWorklet.addModule(new URL('player-worklet.js', document.baseURI).href)
+    // Resolved against the document so it works from a subpath as well as a
+    // domain root. The fingerprint Vite puts in the name is what stops a
+    // cached worklet from silently ignoring messages this page sends.
+    await context.audioWorklet.addModule(new URL(workletUrl, document.baseURI).href)
 
     const node = new AudioWorkletNode(context, 'webaudio-player', {
       numberOfInputs: 0,
@@ -117,6 +126,19 @@ export class Player {
     node.port.onmessage = (event: MessageEvent) => {
       const message = event.data
       if (message?.type !== 'status') return
+
+      /* A capability this page relies on, absent from the reply. The worklet
+       * cannot be the one this build shipped, which in practice means a cached
+       * copy — worth saying out loud, because the symptom is otherwise just a
+       * control that does nothing. */
+      if (message.gain === undefined && !this.staleWorkletReported) {
+        this.staleWorkletReported = true
+        console.warn(
+          'the audio worklet did not report a gain, so it predates this page. ' +
+            'It is probably a cached copy: reload with the cache disabled, or rebuild the page ' +
+            'so the worklet is served under a new name. Controls it does not understand will do nothing.',
+        )
+      }
       this.status = {
         bufferedMs: message.bufferedMs,
         underruns: message.underruns,
