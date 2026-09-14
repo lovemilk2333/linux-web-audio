@@ -1,0 +1,3 @@
+[submodule "capture"]
+	path = capture
+	url = https://github.com/lovemilk2333/linux-ws-audio-capture.git

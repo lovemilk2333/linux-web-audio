@@ -1,0 +1,266 @@
+// Command wsaudiod captures desktop audio and streams it over HTTP.
+//
+// The stream is a long-lived chunked response: a sequence of 16-byte headers
+// each followed by one encoded packet. GET /audio/info describes the stream and
+// is the endpoint a client should consult first; GET /audio/stream?from_seq=N
+// resumes from a sequence number the client has already seen.
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/lovemilk2333/linux-ws-audio/internal/capwsa"
+	"github.com/lovemilk2333/linux-ws-audio/internal/codec"
+	"github.com/lovemilk2333/linux-ws-audio/internal/hub"
+	"github.com/lovemilk2333/linux-ws-audio/internal/server"
+	"github.com/lovemilk2333/linux-ws-audio/internal/source"
+)
+
+type options struct {
+	listen         string
+	codecs         string
+	bitrate        int
+	complexity     int
+	frameDuration  float64
+	sampleRate     int
+	channels       int
+	sink           string
+	historyPackets int
+	clientQueue    int
+	slowClient     string
+	token          string
+	vbr            bool
+	dtx            bool
+	fec            bool
+	logLevel       string
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "wsaudiod: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	var opts options
+
+	flag.StringVar(&opts.listen, "listen", "127.0.0.1:8642",
+		"address to listen on. The default is loopback only, because this streams what the desktop is playing")
+	flag.StringVar(&opts.codecs, "codec", "opus",
+		"codec used for clients that do not request one, or a comma-separated list. Supported: "+strings.Join(codec.Names(), ", "))
+	flag.IntVar(&opts.bitrate, "bitrate", 96000, "target bitrate in bits per second, where the codec has one")
+	flag.IntVar(&opts.complexity, "complexity", 5, "encoder effort, where the codec has one")
+	flag.Float64Var(&opts.frameDuration, "frame-duration", 20, "frame duration in ms (Opus accepts 2.5, 5, 10, 20, 40, 60)")
+	flag.IntVar(&opts.sampleRate, "sample-rate", 48000, "capture sample rate in Hz")
+	flag.IntVar(&opts.channels, "channels", 2, "capture channel count (1, 2, 6 or 8)")
+	flag.StringVar(&opts.sink, "sink", "",
+		"sink whose monitor to capture; empty follows the current default sink")
+	flag.IntVar(&opts.historyPackets, "history-packets", 750,
+		"packets of recent audio kept so a client can resume with ?from_seq")
+	flag.IntVar(&opts.clientQueue, "client-queue", 64, "packets buffered per client before the slow-client policy applies")
+	flag.StringVar(&opts.slowClient, "slow-client", "fast-forward",
+		"what to do with a client that falls behind: fast-forward, drop or disconnect")
+	flag.StringVar(&opts.token, "token", "", "require this bearer token on every request (or set WSA_TOKEN)")
+	flag.BoolVar(&opts.vbr, "vbr", false, "use variable bitrate where supported (Opus runs in constant bitrate by default, as Sunshine does)")
+	flag.BoolVar(&opts.dtx, "dtx", false, "enable discontinuous transmission where supported")
+	flag.BoolVar(&opts.fec, "fec", false, "enable in-band forward error correction where supported")
+	flag.StringVar(&opts.logLevel, "log-level", "info", "log level: debug, info, warning or error")
+
+	version := flag.Bool("version", false, "print the version and exit")
+	flag.Parse()
+
+	if *version {
+		fmt.Printf("wsaudiod %s (capture library %s)\n", server.Version, capwsa.Version())
+		return nil
+	}
+
+	logger, err := newLogger(opts.logLevel)
+	if err != nil {
+		return err
+	}
+
+	token, err := resolveToken(opts.token)
+	if err != nil {
+		return err
+	}
+
+	codecNames, err := codec.ParseList(opts.codecs)
+	if err != nil {
+		return err
+	}
+	if len(codecNames) > 1 {
+		logger.Warn("more than one codec given; the first is the default and the rest are offered on request",
+			"default", codecNames[0], "available", codecNames[1:])
+	}
+
+	slowPolicy, err := hub.ParseSlowPolicy(opts.slowClient)
+	if err != nil {
+		return err
+	}
+
+	frameSamples, err := frameSamplesFor(opts.sampleRate, opts.frameDuration)
+	if err != nil {
+		return err
+	}
+
+	hubCfg := hub.Config{
+		Codec:          codecNames[0],
+		SampleRate:     opts.sampleRate,
+		Channels:       opts.channels,
+		FrameSamples:   frameSamples,
+		Bitrate:        opts.bitrate,
+		Complexity:     opts.complexity,
+		VBR:            opts.vbr,
+		DTX:            opts.dtx,
+		FEC:            opts.fec,
+		HistoryPackets: opts.historyPackets,
+		ClientQueue:    opts.clientQueue,
+		SlowClient:     slowPolicy,
+	}
+
+	broadcast, err := hub.New(hubCfg, logger)
+	if err != nil {
+		return err
+	}
+	defer broadcast.Close()
+
+	src, err := source.Open(source.Config{
+		SampleRate:   opts.sampleRate,
+		Channels:     opts.channels,
+		FrameSamples: frameSamples,
+		Sink:         opts.sink,
+	}, logger)
+	if err != nil {
+		return fmt.Errorf("starting capture: %w", err)
+	}
+	defer src.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- broadcast.Run(ctx, src) }()
+
+	handler := server.New(server.Config{
+		Hub:            broadcast,
+		Source:         src,
+		Token:          token,
+		Codecs:         codecNames,
+		CaptureLibrary: capwsa.Version(),
+		Log:            logger,
+		StartedAt:      time.Now(),
+	})
+
+	httpServer := &http.Server{
+		Addr:    opts.listen,
+		Handler: handler,
+		// A stream is a long-lived response and must not be cut off by a
+		// write deadline, so only the header read is bounded.
+		ReadHeaderTimeout: 10 * time.Second,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
+	}
+
+	serveErr := make(chan error, 1)
+	go func() {
+		logger.Info("listening",
+			"address", opts.listen,
+			"codec", codecNames[0],
+			"sample_rate", opts.sampleRate,
+			"channels", opts.channels,
+			"frame_samples", frameSamples,
+			"frame_duration_ms", opts.frameDuration,
+			"auth", token != "")
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+			return
+		}
+		serveErr <- nil
+	}()
+
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			return fmt.Errorf("http server: %w", err)
+		}
+		return nil
+	case err := <-runErr:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return fmt.Errorf("capture pipeline: %w", err)
+		}
+		return nil
+	case <-ctx.Done():
+		logger.Info("shutting down")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("graceful shutdown did not complete", "error", err)
+	}
+	return nil
+}
+
+// frameSamplesFor converts a frame duration in milliseconds to a sample count.
+func frameSamplesFor(sampleRate int, ms float64) (int, error) {
+	if sampleRate <= 0 {
+		return 0, fmt.Errorf("sample rate must be positive, got %d", sampleRate)
+	}
+	if ms <= 0 {
+		return 0, fmt.Errorf("frame duration must be positive, got %g ms", ms)
+	}
+	samples := int(ms*float64(sampleRate)/1000 + 0.5)
+	if samples <= 0 {
+		return 0, fmt.Errorf("a frame duration of %g ms is too short at %d Hz", ms, sampleRate)
+	}
+	// A frame that does not divide the rate exactly would drift the timestamp
+	// against the wall clock, so reject it rather than accumulate error.
+	if actual := float64(samples) * 1000 / float64(sampleRate); diff(actual, ms) > 0.01 {
+		return 0, fmt.Errorf("a frame duration of %g ms is not representable at %d Hz (nearest is %.3f ms)",
+			ms, sampleRate, actual)
+	}
+	return samples, nil
+}
+
+func diff(a, b float64) float64 {
+	if a > b {
+		return a - b
+	}
+	return b - a
+}
+
+func resolveToken(flagValue string) (string, error) {
+	if flagValue != "" {
+		return flagValue, nil
+	}
+	return os.Getenv("WSA_TOKEN"), nil
+}
+
+func newLogger(level string) (*slog.Logger, error) {
+	var lvl slog.Level
+	switch strings.ToLower(level) {
+	case "debug":
+		lvl = slog.LevelDebug
+	case "info":
+		lvl = slog.LevelInfo
+	case "warning", "warn":
+		lvl = slog.LevelWarn
+	case "error":
+		lvl = slog.LevelError
+	default:
+		return nil, fmt.Errorf("unknown log level %q, expected debug, info, warning or error", level)
+	}
+	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
+	return slog.New(handler), nil
+}

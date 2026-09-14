@@ -1,0 +1,53 @@
+# systemd user unit for wsaudiod.
+#
+# It must run as the user, not as a system service: capture goes through the
+# user's PipeWire/PulseAudio session socket under $XDG_RUNTIME_DIR, which a
+# system service cannot reach.
+#
+#   install -Dm644 deploy/wsaudiod.service ~/.config/systemd/user/wsaudiod.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now wsaudiod
+#
+# If the server should also run while nobody is logged in, enable lingering:
+#   loginctl enable-linger "$USER"
+
+[Unit]
+Description=Desktop audio over HTTP
+Documentation=https://github.com/lovemilk2333/linux-ws-audio
+After=pipewire.service pipewire-pulse.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/wsaudiod --listen 127.0.0.1:8642 --codec opus
+
+# The audio session socket is what this service exists to reach. Without it the
+# unit can start before the session bus is ready and fail to connect.
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+
+Restart=on-failure
+RestartSec=3
+
+# Capture is cheap but the encoder runs continuously, so keep it off the
+# latency-sensitive end of the scheduler.
+Nice=5
+
+# Hardening. The process needs no network beyond its listening socket, no
+# filesystem access beyond its own runtime state, and no privileges.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target
