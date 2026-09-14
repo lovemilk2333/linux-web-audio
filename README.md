@@ -34,18 +34,19 @@ Installing to `/usr/local` works too, but on Arch pkg-config does not search
 ## Build and run
 
 ```sh
-git clone https://github.com/lovemilk2333/linux-web-audio
-cd linux-web-audio
-make build
-
-# or the path which stored `linux-web-audio-capture` so
+# The capture library has to be findable before anything is built. Both are
+# needed when it went to ~/.local rather than a path the system already
+# searches; the first is read by the compiler, the second by the loader.
 export PKG_CONFIG_PATH=~/.local/lib/pkgconfig
 export LD_LIBRARY_PATH=~/.local/lib
 
+git clone https://github.com/lovemilk2333/linux-web-audio
+cd linux-web-audio
+make build
 ./bin/webaudiod
 
 # in another terminal
-curl -s localhost:8642/audio/info
+curl -s localhost:8642/backend/audio/info
 ./bin/webclient -duration 5s
 ```
 
