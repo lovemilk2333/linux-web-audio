@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Package source drives the capture library and publishes frames to the hub.
 //
 // It owns the capture handle and the thread that reads from it, converting the

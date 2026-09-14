@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Command wsclient is a reference client for the linux-ws-audio stream.
 //
 // It is deliberately a plain HTTP client: fetch /audio/info, open

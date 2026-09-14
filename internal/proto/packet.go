@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Package proto implements the wire format streamed over HTTP: a fixed 16-byte
 // header followed by one encoded audio packet.
 //

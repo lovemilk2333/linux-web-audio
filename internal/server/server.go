@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Package server exposes the audio stream over HTTP.
 //
 // Two endpoints matter to a client:

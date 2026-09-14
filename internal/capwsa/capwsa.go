@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Package capwsa binds the libwsaudio C ABI.
 //
 // It is the only package that touches C. Everything above it works with Go

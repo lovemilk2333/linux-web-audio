@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Package hub turns captured audio frames into a broadcast stream.
 //
 // It assigns each captured frame a sequence number and a sample timestamp,

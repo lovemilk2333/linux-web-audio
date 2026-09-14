@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Command wsaudiod captures desktop audio and streams it over HTTP.
 //
 // The stream is a long-lived chunked response: a sequence of 16-byte headers

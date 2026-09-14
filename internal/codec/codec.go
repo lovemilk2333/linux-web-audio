@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // Package codec encodes captured PCM into the payload carried by the wire
 // format.
 //
