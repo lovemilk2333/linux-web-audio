@@ -1,0 +1,184 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
+/* The whole palette, defined once. Components reference these rather than
+   hard-coding colours, so the dark theme is one block rather than a hundred
+   scattered values. Light is the base and dark overrides it, which is what
+   keeps the toggle working in both directions. */
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --panel-edge: #e3e6ea;
+  --text: #1a1d21;
+  --muted: #666d76;
+  --faint: #9aa1aa;
+
+  --accent: #3b6ea8;
+  --accent-text: #ffffff;
+  --accent-dim: #dbe6f2;
+
+  --track: #e7eaee;
+  --mark: #c6ccd3;
+
+  --ok: #3f9e5a;
+  --ok-dim: #7cc48f;
+  --warm: #d79a2b;
+  --hot: #cc4b3f;
+
+  --danger: #b83c30;
+  --warn: #8a6a1f;
+
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #14171a;
+    --panel: #1c2024;
+    --panel-edge: #2a2f35;
+    --text: #e6e9ec;
+    --muted: #9aa3ad;
+    --faint: #6b737c;
+
+    --accent: #6ea3d8;
+    --accent-text: #10161c;
+    --accent-dim: #24313d;
+
+    --track: #2a2f35;
+    --mark: #3c434b;
+
+    --ok: #62c47e;
+    --ok-dim: #3d7d52;
+    --warm: #e0b356;
+    --hot: #e0705f;
+
+    --danger: #e07a6c;
+    --warn: #d8b45f;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #14171a;
+  --panel: #1c2024;
+  --panel-edge: #2a2f35;
+  --text: #e6e9ec;
+  --muted: #9aa3ad;
+  --faint: #6b737c;
+
+  --accent: #6ea3d8;
+  --accent-text: #10161c;
+  --accent-dim: #24313d;
+
+  --track: #2a2f35;
+  --mark: #3c434b;
+
+  --ok: #62c47e;
+  --ok-dim: #3d7d52;
+  --warm: #e0b356;
+  --hot: #e0705f;
+
+  --danger: #e07a6c;
+  --warn: #d8b45f;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 1.5rem;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+h1,
+h2 {
+  margin: 0;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+h1 {
+  font-size: 1.15rem;
+}
+
+h2 {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+code,
+.mono {
+  font-family: var(--mono);
+  font-size: 0.85em;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--panel-edge);
+  border-radius: 10px;
+  padding: 1rem 1.1rem;
+}
+
+button {
+  font: inherit;
+  padding: 0.5rem 1rem;
+  border-radius: 7px;
+  border: 1px solid var(--panel-edge);
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+
+input,
+select {
+  font: inherit;
+  padding: 0.45rem 0.6rem;
+  border-radius: 7px;
+  border: 1px solid var(--panel-edge);
+  background: var(--bg);
+  color: var(--text);
+  width: 100%;
+}
+
+input:focus,
+select:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+label {
+  display: block;
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin-bottom: 0.3rem;
+}
+
+/* Respect a user who has asked for less motion. */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}

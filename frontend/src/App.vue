@@ -1,0 +1,386 @@
+<!-- SPDX-License-Identifier: BSD-3-Clause -->
+<script setup lang="ts">
+import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
+
+import ConnectionPanel from './components/ConnectionPanel.vue'
+import EventLog, { type LogEntry } from './components/EventLog.vue'
+import SettingsPanel from './components/SettingsPanel.vue'
+import StatsPanel from './components/StatsPanel.vue'
+
+import { chooseCodec, createDecoder, opusSupported, type Decoder, type StreamFormat } from './audio/decoder'
+import { Player, type PlayerStatus } from './audio/player'
+import { StreamStats } from './stats'
+import { fetchInfo, StreamReader, type ServerInfo, type StreamState } from './stream'
+
+/** Settings that survive a reload. */
+const STORAGE_KEY = 'linux-web-audio:settings'
+
+interface Settings {
+  baseUrl: string
+  token: string
+  codec: string
+  targetMs: number
+  resume: boolean
+  theme: 'system' | 'light' | 'dark'
+}
+
+function loadSettings(): Settings {
+  const defaults: Settings = {
+    baseUrl: `${location.protocol}//${location.hostname}:8642`,
+    token: '',
+    codec: '',
+    targetMs: 300,
+    resume: true,
+    theme: 'system',
+  }
+
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (!raw) return defaults
+    // Merged over the defaults so a settings object written by an older
+    // version does not leave a field undefined.
+    return { ...defaults, ...(JSON.parse(raw) as Partial<Settings>) }
+  } catch {
+    return defaults
+  }
+}
+
+const settings = reactive<Settings>(loadSettings())
+
+const state = ref<StreamState>('idle')
+const info = shallowRef<ServerInfo | null>(null)
+const error = ref<string | null>(null)
+const busy = ref(false)
+const entries = ref<LogEntry[]>([])
+const playableCodecs = ref<string[]>([])
+/** Bumped on a timer so the stats panel re-renders; its data mutates in place. */
+const tick = ref(0)
+
+const playerStatus = reactive<PlayerStatus>({
+  bufferedMs: 0,
+  underruns: 0,
+  droppedFrames: 0,
+  peak: 0,
+  silent: true,
+  playing: false,
+  playedMs: 0,
+})
+
+const player = new Player()
+const stats = shallowRef(new StreamStats(960))
+let reader: StreamReader | null = null
+let decoder: Decoder | null = null
+let logId = 0
+
+const connected = computed(() => state.value === 'streaming' || state.value === 'reconnecting')
+
+function log(kind: LogEntry['kind'], message: string, missing?: number): void {
+  const now = new Date()
+  const at = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(
+    now.getSeconds(),
+  ).padStart(2, '0')}`
+  entries.value = [{ id: ++logId, at, kind, message, ...(missing ? { missing } : {}) }, ...entries.value].slice(0, 200)
+}
+
+/* Settings are persisted, but through a debounce: the buffer slider fires on
+   every pixel of movement, and writing on each one is pointless work. */
+let saveTimer: number | undefined
+watch(
+  settings,
+  () => {
+    window.clearTimeout(saveTimer)
+    saveTimer = window.setTimeout(() => {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(settings))
+      } catch {
+        // Storage can be full or blocked; the page still works without it.
+      }
+    }, 250)
+  },
+  { deep: true },
+)
+
+watch(
+  () => settings.targetMs,
+  (ms) => player.setTargetMs(ms),
+)
+
+watch(
+  () => settings.theme,
+  (theme) => {
+    if (theme === 'system') {
+      document.documentElement.removeAttribute('data-theme')
+    } else {
+      document.documentElement.setAttribute('data-theme', theme)
+    }
+  },
+  { immediate: true },
+)
+
+onMounted(async () => {
+  const stop = player.onStatus((status) => Object.assign(playerStatus, status))
+  onBeforeUnmount(stop)
+
+  /* The live state, for the console and for the end-to-end tests. Scraping the
+   * rendered text would test the formatter as much as the stream, and would
+   * depend on how the panels happen to be laid out. */
+  Object.defineProperty(window, '__webaudio', {
+    configurable: true,
+    value: {
+      get state() {
+        return state.value
+      },
+      get info() {
+        return info.value
+      },
+      get stats() {
+        return stats.value
+      },
+      get player() {
+        return { ...playerStatus }
+      },
+      get events() {
+        return entries.value
+      },
+      get error() {
+        return error.value
+      },
+    },
+  })
+
+  const ticker = window.setInterval(() => {
+    tick.value++
+  }, 200)
+  onBeforeUnmount(() => window.clearInterval(ticker))
+
+  // Probe the server so the codec list is populated before the user presses
+  // connect; a failure here is normal and simply leaves the field blank.
+  try {
+    await refreshInfo()
+  } catch {
+    // Reported when the user actually tries to connect.
+  }
+
+  // Browsers suspend audio when a tab is hidden. Resuming on return costs
+  // nothing and avoids a silent page that looks connected.
+  const onVisibility = (): void => {
+    if (document.visibilityState === 'visible') void player.resume()
+  }
+  document.addEventListener('visibilitychange', onVisibility)
+  onBeforeUnmount(() => document.removeEventListener('visibilitychange', onVisibility))
+})
+
+onBeforeUnmount(() => {
+  reader?.stop()
+  decoder?.close()
+  void player.stop()
+})
+
+async function refreshInfo(): Promise<ServerInfo> {
+  const fetched = await fetchInfo(settings.baseUrl, settings.token)
+  info.value = fetched
+
+  const format: StreamFormat = { sampleRate: fetched.sample_rate, channels: fetched.channels }
+  const playable: string[] = []
+  if (fetched.codecs.includes('opus') && (await opusSupported(format))) playable.push('opus')
+  for (const name of ['pcm_s16le', 'pcm_f32le']) {
+    if (fetched.codecs.includes(name)) playable.push(name)
+  }
+  playableCodecs.value = playable
+  return fetched
+}
+
+async function connect({ reconnecting = false } = {}): Promise<void> {
+  if (connected.value || busy.value) return
+
+  busy.value = true
+  error.value = null
+
+  // Read before anything is replaced: on a reconnect this is what lets the
+  // server replay the audio produced while the connection was down.
+  const resumeFrom = reconnecting ? stats.value.lastSeq : null
+
+  try {
+    const fetched = await refreshInfo()
+
+    if (!fetched.started) {
+      throw new Error('the server has not captured any audio yet')
+    }
+
+    const format: StreamFormat = { sampleRate: fetched.sample_rate, channels: fetched.channels }
+    const chosen = await chooseCodec(
+      fetched.codecs,
+      format,
+      settings.codec && playableCodecs.value.includes(settings.codec) ? settings.codec : undefined,
+    )
+    settings.codec = chosen.codec
+    log('notice', `using ${chosen.codec} — ${chosen.reason}`)
+
+    // Starting audio requires a user gesture, and this runs from the connect
+    // click, so it is the right moment to build the audio graph — but only
+    // once. Rebuilding it on every reconnect would tear down the buffer and
+    // reintroduce the startup gap for no reason.
+    if (!player.running) {
+      const rate = await player.start(format, settings.targetMs)
+      if (rate !== format.sampleRate) {
+        log(
+          'error',
+          `the browser gave a ${rate} Hz audio context for a ${format.sampleRate} Hz stream, so playback will be pitched`,
+        )
+      }
+    }
+
+    if (!reconnecting) {
+      stats.value = new StreamStats(fetched.frame_samples)
+      stats.value.sampleRate = fetched.sample_rate
+      stats.value.start()
+      player.reset()
+    }
+
+    decoder?.close()
+    decoder = createDecoder(chosen.codec, format, (channels) => player.push(channels), (decodeError) => {
+      log('error', `decode failed: ${decodeError.message}`)
+    })
+
+    reader = new StreamReader({
+      baseUrl: settings.baseUrl,
+      codec: chosen.codec,
+      token: settings.token,
+      resume: settings.resume,
+      resumeFrom,
+      onFrame: (frame) => {
+        stats.value.observe(frame)
+        decoder?.decode(frame)
+      },
+      onEvent: (event) => {
+        log(event.kind, event.message, event.missing)
+        if (event.kind === 'error') error.value = event.message
+        if (event.kind === 'open') error.value = null
+      },
+      onState: (next) => {
+        state.value = next
+      },
+    })
+
+    state.value = 'connecting'
+    void reader.start()
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : String(cause)
+    state.value = 'failed'
+    log('error', error.value)
+  } finally {
+    busy.value = false
+  }
+}
+
+function disconnect(): void {
+  reader?.stop()
+  reader = null
+  decoder?.close()
+  decoder = null
+  stats.value.stop()
+  void player.stop()
+  state.value = 'stopped'
+  log('closed', 'disconnected')
+}
+
+/**
+ * Cuts the connection and reconnects after a moment, to exercise the resume
+ * path the way a real network drop would.
+ *
+ * The pause matters: it gives the server time to produce audio nobody is
+ * receiving, so the replay has something to hand back.
+ */
+function dropConnection(): void {
+  log('notice', 'dropping the connection to exercise the resume path')
+  reader?.stop()
+  reader = null
+  decoder?.close()
+  decoder = null
+  state.value = 'stopped'
+
+  globalThis.setTimeout(() => {
+    void connect({ reconnecting: true })
+  }, 1500)
+}
+</script>
+
+<template>
+  <div class="app">
+    <header>
+      <h1>linux-web-audio</h1>
+      <p class="sub">
+        Desktop audio over an HTTP long connection. The page decodes it with WebCodecs where it can
+        and plays it through an AudioWorklet.
+      </p>
+    </header>
+
+    <div class="columns">
+      <div class="column">
+        <ConnectionPanel
+          v-model:base-url="settings.baseUrl"
+          v-model:token="settings.token"
+          v-model:codec="settings.codec"
+          :state="state"
+          :info="info"
+          :player="playerStatus"
+          :error="error"
+          :busy="busy"
+          :playable-codecs="playableCodecs"
+          @connect="connect"
+          @disconnect="disconnect"
+        />
+        <SettingsPanel
+          v-model:target-ms="settings.targetMs"
+          v-model:resume="settings.resume"
+          v-model:theme="settings.theme"
+          :repeatable="connected"
+          @disconnect-now="dropConnection"
+        />
+      </div>
+
+      <div class="column">
+        <StatsPanel :stats="stats" :player="playerStatus" :connected="connected" :tick="tick" />
+        <EventLog :entries="entries" />
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.app {
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+header {
+  margin-bottom: 1.25rem;
+}
+
+.sub {
+  margin: 0.3rem 0 0;
+  color: var(--muted);
+  font-size: 0.88rem;
+  max-width: 60ch;
+}
+
+.columns {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  gap: 1rem;
+  align-items: start;
+}
+
+.column {
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
+}
+
+/* One column on a narrow screen rather than a squeezed two. */
+@media (max-width: 880px) {
+  .columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+</style>

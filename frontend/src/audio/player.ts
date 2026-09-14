@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: BSD-3-Clause
+
+import type { StreamFormat } from './decoder'
+
+/** The playback buffer's own view of the world, reported from the audio thread. */
+export interface PlayerStatus {
+  /** Audio queued and not yet played, in milliseconds. */
+  bufferedMs: number
+  /** Times the buffer ran dry. */
+  underruns: number
+  /** Frames discarded to keep latency bounded. */
+  droppedFrames: number
+  /** Loudest sample since the last report, 0..1. */
+  peak: number
+  /** Whether the last block was entirely silent. */
+  silent: boolean
+  /** False while the buffer is still filling to the target. */
+  playing: boolean
+  /** Audio played since the player started, in milliseconds. */
+  playedMs: number
+}
+
+const IDLE_STATUS: PlayerStatus = {
+  bufferedMs: 0,
+  underruns: 0,
+  droppedFrames: 0,
+  peak: 0,
+  silent: true,
+  playing: false,
+  playedMs: 0,
+}
+
+/**
+ * Owns the AudioContext and the worklet that actually plays.
+ *
+ * The page's job is only to decode and hand over samples. Everything about
+ * when they are heard happens in the worklet, on the audio thread.
+ */
+export class Player {
+  private context: AudioContext | null = null
+  private node: AudioWorkletNode | null = null
+  private status: PlayerStatus = { ...IDLE_STATUS }
+  private listeners = new Set<(status: PlayerStatus) => void>()
+
+  /** True once the audio graph is running. */
+  get running(): boolean {
+    return this.context !== null && this.context.state === 'running'
+  }
+
+  get sampleRate(): number | null {
+    return this.context?.sampleRate ?? null
+  }
+
+  onStatus(listener: (status: PlayerStatus) => void): () => void {
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
+  }
+
+  /**
+   * Creates the audio graph. Must be called from a user gesture: browsers
+   * refuse to start audio otherwise.
+   *
+   * @returns the rate the context actually runs at, which may differ from the
+   * stream's if the browser declined to resample.
+   */
+  async start(format: StreamFormat, targetMs: number): Promise<number> {
+    await this.stop()
+
+    let context: AudioContext
+    try {
+      // Asking for the stream's rate lets the browser resample the output. A
+      // context at the hardware rate would play 48 kHz audio at the wrong
+      // speed instead.
+      context = new AudioContext({ sampleRate: format.sampleRate })
+    } catch {
+      context = new AudioContext()
+    }
+
+    // The worklet is served as a plain file from the site root, not bundled,
+    // so it is resolved against the document rather than against this module.
+    // That keeps it working whether the page is served from a domain root or
+    // from a subpath.
+    await context.audioWorklet.addModule(new URL('player-worklet.js', document.baseURI).href)
+
+    const node = new AudioWorkletNode(context, 'webaudio-player', {
+      numberOfInputs: 0,
+      numberOfOutputs: 1,
+      outputChannelCount: [format.channels],
+      processorOptions: {
+        channels: format.channels,
+        sampleRate: format.sampleRate,
+        targetMs,
+      },
+    })
+
+    node.port.onmessage = (event: MessageEvent) => {
+      const message = event.data
+      if (message?.type !== 'status') return
+      this.status = {
+        bufferedMs: message.bufferedMs,
+        underruns: message.underruns,
+        droppedFrames: message.droppedFrames,
+        peak: message.peak,
+        silent: message.silent,
+        playing: message.playing === true,
+        playedMs: (message.playedFrames / format.sampleRate) * 1000,
+      }
+      for (const listener of this.listeners) listener(this.status)
+    }
+
+    node.connect(context.destination)
+    await context.resume()
+
+    this.context = context
+    this.node = node
+    return context.sampleRate
+  }
+
+  /** Hands decoded audio to the worklet. */
+  push(channels: Float32Array[]): void {
+    if (!this.node || channels.length === 0) return
+
+    // The buffers are moved rather than copied, so nothing is allocated on the
+    // audio thread and the page keeps no reference to what it just sent.
+    this.node.port.postMessage({ type: 'samples', channels }, channels.map((c) => c.buffer))
+  }
+
+  /** Changes how much audio to hold, trading latency against dropouts. */
+  setTargetMs(targetMs: number): void {
+    this.node?.port.postMessage({ type: 'target', targetMs })
+  }
+
+  /** Clears queued audio and the counters. */
+  reset(): void {
+    this.node?.port.postMessage({ type: 'reset' })
+    this.status = { ...IDLE_STATUS }
+  }
+
+  getStatus(): PlayerStatus {
+    return this.status
+  }
+
+  /** Browsers suspend the context when a tab is hidden; this brings it back. */
+  async resume(): Promise<void> {
+    if (this.context && this.context.state !== 'running') {
+      await this.context.resume()
+    }
+  }
+
+  async stop(): Promise<void> {
+    if (this.node) {
+      this.node.port.onmessage = null
+      this.node.disconnect()
+      this.node = null
+    }
+    if (this.context) {
+      await this.context.close()
+      this.context = null
+    }
+    this.status = { ...IDLE_STATUS }
+  }
+}

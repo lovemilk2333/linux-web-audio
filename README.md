@@ -48,12 +48,35 @@ curl -s localhost:8642/audio/info
 ```
 
 Requirements: Go 1.24+, `libopus` with development headers, and the capture
-library above. On Arch: `pacman -S go opus`.
+library above. On Arch: `pacman -S go opus`. The browser frontend additionally
+needs Node 20+ and pnpm.
 
 `make check-lib` prints the install instructions above if pkg-config cannot find
 the library.
 
-## Listening to it
+## Listening in a browser
+
+`frontend/` is a Vue 3 + Vite page that plays the stream through an AudioWorklet
+and shows what the protocol is doing: packet rate, buffer level, gaps, and the
+resume path. It decodes Opus with WebCodecs where the browser supports it, and
+otherwise asks the server for raw PCM.
+
+```sh
+cd frontend
+pnpm install
+pnpm dev                                   # http://127.0.0.1:5173
+```
+
+It is served separately from the API, which makes it a cross-origin client, so
+the server needs its origin allowed:
+
+```sh
+./bin/webaudiod --cors 'http://127.0.0.1:5173'
+```
+
+See [`frontend/README.md`](frontend/README.md).
+
+## Listening from the command line
 
 `webclient` is a reference client. It verifies continuity, and can decode the
 stream back to a WAV:
@@ -170,6 +193,7 @@ client knows. Measured impact on a fast client while another is throttled to
 ```
 cmd/webaudiod       the server
 cmd/webclient       reference client, and the tool used to verify the protocol
+frontend/           browser player, served separately from the API
 internal/proto      the wire format, and the wrap-safe sequence arithmetic
 internal/codec      Opus and raw PCM encoders, selected by name
 internal/hub        broadcast core: sequencing, history, fan-out, slow clients
