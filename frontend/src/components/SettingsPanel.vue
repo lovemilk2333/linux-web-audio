@@ -2,6 +2,10 @@
 <script setup lang="ts">
 defineProps<{
   targetMs: number
+  /** Smallest sensible buffer: two frames, since audio arrives one frame at a time. */
+  minTargetMs: number
+  /** Buffers are measured in whole frames. */
+  targetStepMs: number
   resume: boolean
   theme: 'system' | 'light' | 'dark'
   repeatable: boolean
@@ -28,14 +32,19 @@ const emit = defineEmits<{
           this much. More absorbs jitter and stalls; less gets you closer to live. Past twice this,
           the oldest audio is discarded to keep the delay from growing.
         </p>
+        <p class="hint detail">
+          The floor is two frames ({{ minTargetMs }} ms here) and the step is one, because audio
+          arrives a frame at a time — asking for less than a couple of frames is asking the buffer
+          to start empty.
+        </p>
       </div>
       <div class="control">
         <input
           id="target"
           type="range"
-          min="50"
-          max="1500"
-          step="50"
+          :min="minTargetMs"
+          :max="1500"
+          :step="targetStepMs"
           :value="targetMs"
           @input="emit('update:targetMs', Number(($event.target as HTMLInputElement).value))"
         />
@@ -125,6 +134,11 @@ const emit = defineEmits<{
   margin: 0;
   font-size: 0.78rem;
   color: var(--muted);
+}
+
+.detail {
+  margin-top: 0.35rem;
+  color: var(--faint);
 }
 
 .control {

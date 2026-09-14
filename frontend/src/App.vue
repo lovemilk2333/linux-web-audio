@@ -7,7 +7,7 @@ import EventLog, { type LogEntry } from './components/EventLog.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import StatsPanel from './components/StatsPanel.vue'
 
-import { chooseCodec, createDecoder, opusSupported, type Decoder, type StreamFormat } from './audio/decoder'
+import { chooseCodec, createDecoder, opusPath, type Decoder, type StreamFormat } from './audio/decoder'
 import { Player, type PlayerStatus } from './audio/player'
 import { StreamStats } from './stats'
 import { fetchInfo, StreamReader, type ServerInfo, type StreamState } from './stream'
@@ -53,6 +53,8 @@ const error = ref<string | null>(null)
 const busy = ref(false)
 const entries = ref<LogEntry[]>([])
 const playableCodecs = ref<string[]>([])
+/** How Opus will be decoded here, once the server's format is known. */
+const opusDecodePath = ref<'webcodecs' | 'wasm' | 'none'>('none')
 /** Bumped on a timer so the stats panel re-renders; its data mutates in place. */
 const tick = ref(0)
 
@@ -73,6 +75,12 @@ let decoder: Decoder | null = null
 let logId = 0
 
 const connected = computed(() => state.value === 'streaming' || state.value === 'reconnecting')
+
+/* The buffer is measured in frames, because that is the unit audio arrives in.
+ * One frame gives no margin at all — the buffer would start already empty and
+ * every late packet would be heard — so the floor is two. */
+const targetStepMs = computed(() => Math.max(1, Math.round(info.value?.frame_duration_ms ?? 20)))
+const minTargetMs = computed(() => targetStepMs.value * 2)
 
 function log(kind: LogEntry['kind'], message: string, missing?: number): void {
   const now = new Date()
@@ -180,9 +188,22 @@ async function refreshInfo(): Promise<ServerInfo> {
   const fetched = await fetchInfo(settings.baseUrl, settings.token)
   info.value = fetched
 
+  // A stored setting can be below the floor for this server's frame size — a
+  // server started with a longer frame duration moves the floor up.
+  const floor = Math.round(fetched.frame_duration_ms) * 2
+  if (settings.targetMs < floor) {
+    settings.targetMs = floor
+  }
+
   const format: StreamFormat = { sampleRate: fetched.sample_rate, channels: fetched.channels }
+
+  // Opus is playable either way — natively where WebCodecs exists, otherwise
+  // through the WASM decoder — so everything the server offers is playable.
   const playable: string[] = []
-  if (fetched.codecs.includes('opus') && (await opusSupported(format))) playable.push('opus')
+  if (fetched.codecs.includes('opus')) {
+    playable.push('opus')
+    opusDecodePath.value = await opusPath(format)
+  }
   for (const name of ['pcm_s16le', 'pcm_f32le']) {
     if (fetched.codecs.includes(name)) playable.push(name)
   }
@@ -238,13 +259,30 @@ async function connect({ reconnecting = false } = {}): Promise<void> {
     }
 
     decoder?.close()
-    decoder = createDecoder(chosen.codec, format, (channels) => player.push(channels), (decodeError) => {
-      log('error', `decode failed: ${decodeError.message}`)
-    })
+    const sink = (channels: Float32Array[]) => player.push(channels)
+    const onDecodeError = (decodeError: Error) => log('error', `decode failed: ${decodeError.message}`)
+
+    let activeCodec = chosen.codec
+    try {
+      decoder = await createDecoder(activeCodec, format, sink, onDecodeError)
+    } catch (cause) {
+      // Most likely the WASM decoder could not be fetched. Falling back to raw
+      // PCM keeps audio playing at a cost in bandwidth, which beats silence.
+      const fallback = fetched.codecs.find((name) => name.startsWith('pcm_'))
+      if (activeCodec !== 'opus' || !fallback) throw cause
+
+      log('error', `Opus decoding is unavailable: ${describeError(cause)}`)
+      activeCodec = fallback
+      decoder = await createDecoder(activeCodec, format, sink, onDecodeError)
+      log('notice', `falling back to ${activeCodec}, about sixteen times the bandwidth`)
+    }
+    if (activeCodec !== chosen.codec) {
+      settings.codec = activeCodec
+    }
 
     reader = new StreamReader({
       baseUrl: settings.baseUrl,
-      codec: chosen.codec,
+      codec: activeCodec,
       token: settings.token,
       resume: settings.resume,
       resumeFrom,
@@ -271,6 +309,10 @@ async function connect({ reconnecting = false } = {}): Promise<void> {
   } finally {
     busy.value = false
   }
+}
+
+function describeError(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause)
 }
 
 function disconnect(): void {
@@ -332,6 +374,8 @@ function dropConnection(): void {
         />
         <SettingsPanel
           v-model:target-ms="settings.targetMs"
+          :min-target-ms="minTargetMs"
+          :target-step-ms="targetStepMs"
           v-model:resume="settings.resume"
           v-model:theme="settings.theme"
           :repeatable="connected"

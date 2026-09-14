@@ -58,8 +58,12 @@ the library.
 
 `frontend/` is a Vue 3 + Vite page that plays the stream through an AudioWorklet
 and shows what the protocol is doing: packet rate, buffer level, gaps, and the
-resume path. It decodes Opus with WebCodecs where the browser supports it, and
-otherwise asks the server for raw PCM.
+resume path.
+
+Opus is decoded with WebCodecs where the browser has it, and otherwise by an
+`opus-decoder` WASM chunk fetched on demand — so a phone keeps the 96 kbps
+stream instead of falling back to the ~1.5 Mbps raw PCM, which is only used
+when neither is available.
 
 ```sh
 cd frontend

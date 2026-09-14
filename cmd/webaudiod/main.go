@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -125,6 +126,12 @@ func run() error {
 		return err
 	}
 
+	// Checked before the capture is opened, so a bad address fails immediately
+	// rather than after the audio device has been claimed and released.
+	if err := checkListen(opts.listen, token != "", logger); err != nil {
+		return err
+	}
+
 	hubCfg := hub.Config{
 		Codec:          codecNames[0],
 		SampleRate:     opts.sampleRate,
@@ -222,6 +229,49 @@ func run() error {
 		logger.Warn("graceful shutdown did not complete", "error", err)
 	}
 	return nil
+}
+
+// checkListen validates the listen address and warns when it is about to expose
+// the machine's audio more widely than the operator may realise.
+//
+// The address is passed straight to the listener, whose own error for a missing
+// host is "missing port in address" — which sends you looking at the port you
+// did supply. Validating here says what is actually wrong.
+func checkListen(addr string, hasToken bool, logger *slog.Logger) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid --listen %q: expected host:port, for example 127.0.0.1:8642, "+
+			"or :8642 for every interface", addr)
+	}
+
+	number, err := strconv.Atoi(port)
+	if err != nil {
+		return fmt.Errorf("invalid --listen %q: %q is not a port number", addr, port)
+	}
+	if number < 1 || number > 65535 {
+		return fmt.Errorf("invalid --listen %q: port %d is outside 1..65535", addr, number)
+	}
+
+	// An empty host means every interface. Anything not loopback is reachable
+	// from the network, which for a stream of the desktop's audio is worth
+	// saying out loud when there is no token in front of it.
+	if !hasToken && !isLoopback(host) {
+		logger.Warn("listening beyond this machine without a token: anyone who can reach this port "+
+			"can listen to this machine's audio; pass --token, or use --listen 127.0.0.1:8642",
+			"address", addr)
+	}
+	return nil
+}
+
+// isLoopback reports whether a listen host is reachable only locally.
+func isLoopback(host string) bool {
+	switch host {
+	case "", "localhost":
+		// An empty host is every interface, not loopback.
+		return host == "localhost"
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // frameSamplesFor converts a frame duration in milliseconds to a sample count.
