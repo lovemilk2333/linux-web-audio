@@ -66,7 +66,16 @@ const playerStatus = reactive<PlayerStatus>({
   silent: true,
   playing: false,
   playedMs: 0,
+  targetMs: 0,
 })
+
+/* Bound once for the template. Deliberately not named `location`: that would
+ * shadow window.location for the whole module, including loadSettings. */
+const pageLocation = {
+  origin: window.location.origin,
+  hostname: window.location.hostname,
+  port: window.location.port,
+}
 
 const player = new Player()
 const stats = shallowRef(new StreamStats(960))
@@ -76,11 +85,54 @@ let logId = 0
 
 const connected = computed(() => state.value === 'streaming' || state.value === 'reconnecting')
 
+/* Both AudioWorklet and WebCodecs are secure-context-only. Rather than let the
+ * user find that out as a TypeError when they press connect, say so on arrival
+ * and give the ways out. */
+const insecureContext = computed(() => !window.isSecureContext)
+const insecureRemedy = computed(() => {
+  const port = pageLocation.port || '4173'
+  return [
+    'Serve the page over https:// — a self-signed certificate is enough.',
+    `Open it as http://localhost:${port} instead of http://${pageLocation.hostname}:${port}. ` +
+      `From a phone, "adb reverse tcp:${port} tcp:${port}" makes the phone's own localhost reach this server, and localhost counts as secure.`,
+    `For a temporary exception, Chrome accepts --unsafely-treat-insecure-origin-as-secure=${pageLocation.origin}`,
+  ]
+})
+
 /* The buffer is measured in frames, because that is the unit audio arrives in.
- * One frame gives no margin at all — the buffer would start already empty and
- * every late packet would be heard — so the floor is two. */
-const targetStepMs = computed(() => Math.max(1, Math.round(info.value?.frame_duration_ms ?? 20)))
-const minTargetMs = computed(() => targetStepMs.value * 2)
+ *
+ * Deliberately not rounded. Opus allows a 2.5 ms frame, and rounding the step
+ * to whole milliseconds would put the floor at 6 ms for a stream whose frames
+ * are 2.5 ms, when 5 ms is exactly two of them. */
+const targetStepMs = computed(() => {
+  const ms = info.value?.frame_duration_ms ?? 20
+  return ms > 0 ? ms : 20
+})
+
+/** Frames per Web Audio render block; process() is always handed this many. */
+const RENDER_QUANTUM = 128
+
+/* The floor is two frames, or four render blocks, whichever is longer.
+ *
+ * Two frames is the logical minimum: one is a buffer that starts already
+ * empty. But that is not always enough in practice, because the audio thread
+ * is handed whole blocks and has to fill each one from the queue. A 2.5 ms
+ * frame is 120 samples, smaller than a 128-sample block, so two of them is
+ * 1.9 blocks — not enough to cover a block plus the wait for the next packet.
+ *
+ * Measured at 2.5 ms frames: a 5 ms buffer dropped out 476 times in three
+ * seconds. Four blocks was clean but marginal, still losing a packet every
+ * second or two under load, because the floor also has to absorb main-thread
+ * jitter — every packet is decoded there before it is posted to this thread.
+ * Six blocks is comfortable at the floor and still cheap: ~16 ms. */
+const minTargetMs = computed(() => {
+  const step = targetStepMs.value
+  const sampleRate = info.value?.sample_rate || 48000
+  const blockMs = ((6 * RENDER_QUANTUM) / sampleRate) * 1000
+  const floorMs = Math.max(step * 2, blockMs)
+  // Landed on a whole number of frames, since that is what the buffer holds.
+  return Math.ceil(floorMs / step) * step
+})
 
 function log(kind: LogEntry['kind'], message: string, missing?: number): void {
   const now = new Date()
@@ -188,12 +240,14 @@ async function refreshInfo(): Promise<ServerInfo> {
   const fetched = await fetchInfo(settings.baseUrl, settings.token)
   info.value = fetched
 
-  // A stored setting can be below the floor for this server's frame size — a
-  // server started with a longer frame duration moves the floor up.
-  const floor = Math.round(fetched.frame_duration_ms) * 2
-  if (settings.targetMs < floor) {
-    settings.targetMs = floor
-  }
+  // A stored setting can fall outside what this server's frame size allows: a
+  // longer frame duration moves the floor up, and any duration can move the
+  // step, so a value from a previous session may no longer land on one.
+  const step = fetched.frame_duration_ms > 0 ? fetched.frame_duration_ms : 20
+  const blockMs = ((6 * RENDER_QUANTUM) / (fetched.sample_rate || 48000)) * 1000
+  const floor = Math.ceil(Math.max(step * 2, blockMs) / step) * step
+  const snapped = Math.round(settings.targetMs / step) * step
+  settings.targetMs = Math.max(snapped, floor)
 
   const format: StreamFormat = { sampleRate: fetched.sample_rate, channels: fetched.channels }
 
@@ -357,6 +411,18 @@ function dropConnection(): void {
       </p>
     </header>
 
+    <div v-if="insecureContext" class="banner bad">
+      <strong>This page is not a secure context, so audio cannot play here.</strong>
+      <p>
+        Browsers only expose the AudioWorklet and WebCodecs APIs over <code>https://</code> or on
+        <code>localhost</code>. Loading the page from <code>{{ pageLocation.origin }}</code> strips both,
+        so there is nothing to decode into and nothing to play through.
+      </p>
+      <ul>
+        <li v-for="(remedy, index) in insecureRemedy" :key="index">{{ remedy }}</li>
+      </ul>
+    </div>
+
     <div class="columns">
       <div class="column">
         <ConnectionPanel
@@ -406,6 +472,34 @@ header {
   color: var(--muted);
   font-size: 0.88rem;
   max-width: 60ch;
+}
+
+.banner {
+  border: 1px solid var(--panel-edge);
+  border-radius: 10px;
+  padding: 0.9rem 1.1rem;
+  margin-bottom: 1rem;
+  font-size: 0.86rem;
+}
+
+.banner.bad {
+  border-color: var(--hot);
+  background: color-mix(in srgb, var(--hot) 8%, var(--panel));
+}
+
+.banner p {
+  margin: 0.5rem 0 0;
+  color: var(--muted);
+}
+
+.banner ul {
+  margin: 0.6rem 0 0;
+  padding-left: 1.2rem;
+  color: var(--muted);
+}
+
+.banner li {
+  margin-bottom: 0.25rem;
 }
 
 .columns {

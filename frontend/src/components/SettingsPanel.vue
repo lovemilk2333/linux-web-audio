@@ -33,9 +33,12 @@ const emit = defineEmits<{
           the oldest audio is discarded to keep the delay from growing.
         </p>
         <p class="hint detail">
-          The floor is two frames ({{ minTargetMs }} ms here) and the step is one, because audio
-          arrives a frame at a time — asking for less than a couple of frames is asking the buffer
-          to start empty.
+          The step is one frame and the floor is {{ minTargetMs }} ms here. Audio arrives a frame at
+          a time, so a smaller step asks for a fraction of a packet; and the audio thread is handed
+          128-sample blocks, so a buffer of only a frame or two cannot cover a block plus the wait
+          for the next packet — and every packet is decoded on the main thread before it reaches
+          the audio thread, which adds jitter of its own. Below this floor the dropouts are
+          continuous.
         </p>
       </div>
       <div class="control">

@@ -18,6 +18,8 @@ export interface PlayerStatus {
   playing: boolean
   /** Audio played since the player started, in milliseconds. */
   playedMs: number
+  /** The target the audio thread is actually holding, in milliseconds. */
+  targetMs: number
 }
 
 const IDLE_STATUS: PlayerStatus = {
@@ -28,6 +30,7 @@ const IDLE_STATUS: PlayerStatus = {
   silent: true,
   playing: false,
   playedMs: 0,
+  targetMs: 0,
 }
 
 /**
@@ -76,6 +79,18 @@ export class Player {
       context = new AudioContext()
     }
 
+    /* AudioWorklet, like WebCodecs, exists only in a secure context. Over plain
+     * HTTP from anywhere but localhost the property is simply absent, and
+     * calling addModule on it throws "cannot read properties of undefined" —
+     * which says nothing about the actual problem. */
+    if (!context.audioWorklet) {
+      throw new Error(
+        `this page has no AudioWorklet, because ${location.origin} is not a secure context. ` +
+          'Browsers provide audio worklets (and WebCodecs) only over https:// or on localhost. ' +
+          'Serving the page over plain http:// from another host strips them. See the README.',
+      )
+    }
+
     // The worklet is served as a plain file from the site root, not bundled,
     // so it is resolved against the document rather than against this module.
     // That keeps it working whether the page is served from a domain root or
@@ -104,6 +119,7 @@ export class Player {
         silent: message.silent,
         playing: message.playing === true,
         playedMs: (message.playedFrames / format.sampleRate) * 1000,
+        targetMs: message.targetMs ?? 0,
       }
       for (const listener of this.listeners) listener(this.status)
     }

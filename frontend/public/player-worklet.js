@@ -74,10 +74,7 @@ class PlayerProcessor extends AudioWorkletProcessor {
         this.enqueue(message.channels)
         break
       case 'target':
-        this.targetMs = message.targetMs
-        // Apply the new target immediately rather than waiting for the next
-        // overflow, so moving the slider has a visible effect.
-        this.trim()
+        this.setTarget(message.targetMs)
         break
       case 'reset':
         this.queue = []
@@ -93,31 +90,82 @@ class PlayerProcessor extends AudioWorkletProcessor {
     }
   }
 
-  enqueue(channels) {
-    if (!channels || channels.length === 0 || channels[0].length === 0) return
+  /**
+   * Changes how much audio to hold, in whichever direction that means.
+   *
+   * A live source arrives at exactly playback speed, so a buffer below its
+   * target never fills on its own: the level is whatever it was. Raising the
+   * target therefore has to pause playback until it fills, and lowering it has
+   * to discard the difference. Anything else makes the control do nothing in
+   * one direction, which is what it did before.
+   */
+  setTarget(targetMs) {
+    this.targetMs = targetMs
 
-    this.queue.push(channels)
-    this.buffered += channels[0].length
-    this.trim()
+    if (this.buffered > this.targetFrames) {
+      this.trimTo(this.targetFrames)
+      this.playing = true
+      return
+    }
+
+    // Below the target: stop playing so the buffer can build. Nothing is
+    // dropped, so this costs the difference in delay, once.
+    this.playing = false
+  }
+
+  /** Frames left in the head chunk that have not been played yet. */
+  headRemaining() {
+    return this.queue.length === 0 ? 0 : this.queue[0][0].length - this.offset
   }
 
   /**
-   * Discards the oldest audio once the buffer exceeds twice the target.
+   * Drops the oldest chunk, counting only the part that had not been played.
    *
-   * Trimming to exactly the target rather than to the high water mark matters:
-   * stopping just below the limit would leave the buffer permanently full, and
-   * the next chunk would trim again — a drop on every packet.
+   * `buffered` counts unplayed frames, and a chunk being read from has already
+   * had `offset` frames subtracted. Taking the whole length off again drives
+   * the count negative, which then never recovers.
    */
-  trim() {
-    const limit = Math.max(this.targetFrames * 2, this.sampleRate / 2)
-    if (this.buffered <= limit) return
+  dropHead() {
+    const head = this.queue.shift()
+    const unplayed = head[0].length - this.offset
+    this.buffered -= unplayed
+    this.droppedFrames += unplayed
+    this.offset = 0
+  }
 
-    while (this.queue.length > 0 && this.buffered - this.queue[0].length >= this.targetFrames) {
-      const dropped = this.queue.shift()
-      this.buffered -= dropped[0].length
-      this.droppedFrames += dropped[0].length
-      this.offset = 0
+  /** Discards the oldest audio until no more than `limitFrames` remain. */
+  trimTo(limitFrames) {
+    while (this.queue.length > 1 && this.buffered - this.headRemaining() >= limitFrames) {
+      this.dropHead()
     }
+  }
+
+  enqueue(channels) {
+    if (!channels || channels.length === 0 || channels[0].length === 0) return
+
+    const arrived = channels[0].length
+    this.queue.push(channels)
+    this.buffered += arrived
+    this.trim(arrived)
+  }
+
+  /**
+   * Discards the oldest audio when the buffer exceeds the target by more than
+   * one chunk.
+   *
+   * The allowance is one chunk, not a fixed span: chunks are what arrive, so
+   * any smaller allowance would trim on every packet. It deliberately does not
+   * scale with the target either — an absolute floor here meant a small target
+   * was never honoured, and the buffer would grow to the floor before anything
+   * was dropped, which is the opposite of what asking for low latency means.
+   *
+   * This is what keeps the audio current after a resume, when the server
+   * replays the missed backlog in one burst: without it, the client would sit
+   * behind by however long the connection was down.
+   */
+  trim(arrived) {
+    if (this.buffered <= this.targetFrames + arrived) return
+    this.trimTo(this.targetFrames)
   }
 
   process(_inputs, outputs) {
@@ -203,6 +251,7 @@ class PlayerProcessor extends AudioWorkletProcessor {
       peak: this.peak,
       silent: this.silent,
       playing: this.playing,
+      targetMs: this.targetMs,
     })
     this.peak = 0
   }
