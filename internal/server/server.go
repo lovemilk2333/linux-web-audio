@@ -23,10 +23,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lovemilk2333/linux-ws-audio/internal/codec"
-	"github.com/lovemilk2333/linux-ws-audio/internal/hub"
-	"github.com/lovemilk2333/linux-ws-audio/internal/proto"
-	"github.com/lovemilk2333/linux-ws-audio/internal/source"
+	"github.com/lovemilk2333/linux-web-audio/internal/codec"
+	"github.com/lovemilk2333/linux-web-audio/internal/hub"
+	"github.com/lovemilk2333/linux-web-audio/internal/proto"
+	"github.com/lovemilk2333/linux-web-audio/internal/source"
 )
 
 // Version is the server version reported by /audio/info and --version.
@@ -75,7 +75,7 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 
 		provided, ok := bearerToken(r)
 		if !ok || provided != s.cfg.Token {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="linux-ws-audio"`)
+			w.Header().Set("WWW-Authenticate", `Bearer realm="linux-web-audio"`)
 			writeJSONError(w, http.StatusUnauthorized, "a bearer token is required")
 			return
 		}

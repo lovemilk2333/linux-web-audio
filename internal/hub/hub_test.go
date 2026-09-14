@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lovemilk2333/linux-ws-audio/internal/proto"
+	"github.com/lovemilk2333/linux-web-audio/internal/proto"
 )
 
 const (

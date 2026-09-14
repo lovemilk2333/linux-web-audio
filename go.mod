@@ -1,4 +1,4 @@
-module github.com/lovemilk2333/linux-ws-audio
+module github.com/lovemilk2333/linux-web-audio
 
 go 1.27.1
 

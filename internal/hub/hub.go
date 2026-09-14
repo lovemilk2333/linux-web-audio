@@ -20,8 +20,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/lovemilk2333/linux-ws-audio/internal/codec"
-	"github.com/lovemilk2333/linux-ws-audio/internal/proto"
+	"github.com/lovemilk2333/linux-web-audio/internal/codec"
+	"github.com/lovemilk2333/linux-web-audio/internal/proto"
 )
 
 // Frame is one captured frame of interleaved float32 PCM. Flags carries

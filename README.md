@@ -1,4 +1,4 @@
-# linux-ws-audio
+# linux-web-audio
 
 Desktop audio, captured on Linux and streamed over HTTP as Opus.
 
@@ -8,7 +8,7 @@ lives in a separate GPL-3 licensed shared library, pulled in as a submodule.
 
 ```
 default sink's monitor
-  └─(pa_simple_read)  libwsaudio.so ── capture/  (C++, GPL-3.0)
+  └─(pa_simple_read)  libwebaudio.so ── capture/  (C++, GPL-3.0)
        └─(cgo)  one 20 ms frame at a time
             └─ hub: assign seq + sample timestamp, encode once per codec,
                     record history, fan out to every client
@@ -18,14 +18,14 @@ default sink's monitor
 ## Quick start
 
 ```sh
-git clone --recurse-submodules https://github.com/lovemilk2333/linux-ws-audio
-cd linux-ws-audio
+git clone --recurse-submodules https://github.com/lovemilk2333/linux-web-audio
+cd linux-web-audio
 make build
-./bin/wsaudiod
+./bin/webaudiod
 
 # in another terminal
 curl -s localhost:8642/audio/info
-./bin/wsclient -duration 5s
+./bin/webclient -duration 5s
 ```
 
 Requirements: a C++17 compiler, CMake, Go 1.24+, `libpulse-simple` and `libopus`
@@ -35,18 +35,18 @@ On Arch: `pacman -S base-devel cmake go libpulse opus`.
 
 ## Listening to it
 
-`wsclient` is a reference client. It verifies continuity, and can decode the
+`webclient` is a reference client. It verifies continuity, and can decode the
 stream back to a WAV:
 
 ```sh
-./bin/wsclient -duration 10s -out capture.wav
+./bin/webclient -duration 10s -out capture.wav
 ```
 
 It also exercises the part of the protocol that is easy to get wrong — dropping
 the connection and resuming without a gap:
 
 ```sh
-./bin/wsclient -resume-test -resume-after 2s
+./bin/webclient -resume-test -resume-after 2s
 ```
 
 ```
@@ -72,7 +72,7 @@ within a second and reports the move in `/audio/info`.
 A specific device can be pinned instead:
 
 ```sh
-./bin/wsaudiod --sink alsa_output.pci-0000_00_1f.3.analog-stereo
+./bin/webaudiod --sink alsa_output.pci-0000_00_1f.3.analog-stereo
 ```
 
 This is deliberately **not** a virtual sound device: it does not create a null
@@ -80,7 +80,7 @@ sink or reroute anything, so apps keep playing to where the user expects. The
 trade-off is that it captures all system audio rather than one application's.
 
 Because capture goes through the session's audio socket, the server must run as
-the logged-in user — that is what [`deploy/wsaudiod.service`](deploy/wsaudiod.service)
+the logged-in user — that is what [`deploy/webaudiod.service`](deploy/webaudiod.service)
 is for.
 
 ## Options
@@ -104,8 +104,8 @@ Multiple codecs can be offered at once. Each is encoded once per frame and only
 while it has a subscriber, so an idle codec costs nothing:
 
 ```sh
-./bin/wsaudiod --codec opus,pcm_s16le
-./bin/wsclient -codec pcm_s16le -duration 3s    # the known-length codec
+./bin/webaudiod --codec opus,pcm_s16le
+./bin/webclient -codec pcm_s16le -duration 3s    # the known-length codec
 ```
 
 ## Behaviour worth knowing
@@ -114,7 +114,7 @@ while it has a subscriber, so an idle codec costs nothing:
 goes idle, the server sends silence rather than nothing. A stream whose packets
 stop arriving is indistinguishable from a broken one at the client, and any
 client using packet arrival as its clock would stall. It also makes packet
-counts a dependable clock: `wsclient` reports 6.020 s of audio in 6.019 s of
+counts a dependable clock: `webclient` reports 6.020 s of audio in 6.019 s of
 wall clock.
 
 **Timestamps are a media clock, not wall clock.** They count samples and advance
@@ -144,16 +144,16 @@ code is video-only. So does this, which on a PipeWire system means going through
 ## Repository layout
 
 ```
-cmd/wsaudiod       the server
-cmd/wsclient       reference client, and the tool used to verify the protocol
-internal/proto     the wire format, and the wrap-safe sequence arithmetic
-internal/codec     Opus and raw PCM encoders, selected by name
-internal/hub       broadcast core: sequencing, history, fan-out, slow clients
-internal/server    the HTTP surface
-internal/source    drives the capture library and publishes frames
-internal/capwsa    the only package that touches C
-capture/           submodule: the GPL-3 capture library
-docs/protocol.md   the wire format, for anyone writing a client
+cmd/webaudiod       the server
+cmd/webclient       reference client, and the tool used to verify the protocol
+internal/proto      the wire format, and the wrap-safe sequence arithmetic
+internal/codec      Opus and raw PCM encoders, selected by name
+internal/hub        broadcast core: sequencing, history, fan-out, slow clients
+internal/server     the HTTP surface
+internal/source     drives the capture library and publishes frames
+internal/capweba    the only package that touches C
+capture/            submodule: the GPL-3 capture library
+docs/protocol.md    the wire format, for anyone writing a client
 ```
 
 ## Building and testing
@@ -163,7 +163,7 @@ The Go binaries link the capture library, so **the library must be built first**
 has run once.
 
 ```sh
-make lib      # build capture/build/libwsaudio.so from the submodule
+make lib      # build capture/build/libwebaudio.so from the submodule
 make build    # build both binaries into bin/
 make test     # the library's self test, then the Go tests
 make run      # build and start the server
@@ -177,8 +177,8 @@ works with nothing built.
 The library's own tests:
 
 ```sh
-capture/build/wsaudio_selftest              # asserts format, cadence, lifecycle
-capture/build/wsacap-dump out.wav 5         # capture to a WAV, with live stats
+capture/build/webaudio_selftest              # asserts format, cadence, lifecycle
+capture/build/webacap-dump out.wav 5         # capture to a WAV, with live stats
 ```
 
 ## Licence

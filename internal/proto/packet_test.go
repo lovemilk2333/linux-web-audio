@@ -37,10 +37,10 @@ func TestMarshalRoundTrip(t *testing.T) {
 	}
 }
 
-func TestMagicIsWSAU(t *testing.T) {
+func TestMagicIsWEBU(t *testing.T) {
 	raw := Marshal(Header{}, nil)
-	if string(raw[0:4]) != "WSAU" {
-		t.Errorf("magic bytes = %q, want %q", raw[0:4], "WSAU")
+	if string(raw[0:4]) != "WEBU" {
+		t.Errorf("magic bytes = %q, want %q", raw[0:4], "WEBU")
 	}
 	// The constant has to agree with the bytes actually written.
 	if binary.BigEndian.Uint32(raw[0:4]) != Magic {

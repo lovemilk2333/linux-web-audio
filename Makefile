@@ -1,4 +1,4 @@
-# linux-ws-audio
+# linux-web-audio
 #
 # The Go binaries link the capture library, so the library has to exist before
 # `go build` runs. Every target that compiles Go therefore depends on `lib`.
@@ -7,7 +7,7 @@ SHELL := /bin/bash
 
 CAPTURE_DIR   := capture
 CAPTURE_BUILD := $(CAPTURE_DIR)/build
-CAPTURE_LIB   := $(CAPTURE_BUILD)/libwsaudio.so
+CAPTURE_LIB   := $(CAPTURE_BUILD)/libwebaudio.so
 
 BIN_DIR := bin
 PREFIX  ?= /usr/local
@@ -39,9 +39,9 @@ $(CAPTURE_LIB): $(CAPTURE_SOURCES)
 ## build: build the Go binaries
 build: lib
 	@mkdir -p $(BIN_DIR)
-	$(GO) build -o $(BIN_DIR)/wsaudiod ./cmd/wsaudiod
-	$(GO) build -o $(BIN_DIR)/wsclient  ./cmd/wsclient
-	@echo "built $(BIN_DIR)/wsaudiod and $(BIN_DIR)/wsclient"
+	$(GO) build -o $(BIN_DIR)/webaudiod ./cmd/webaudiod
+	$(GO) build -o $(BIN_DIR)/webclient  ./cmd/webclient
+	@echo "built $(BIN_DIR)/webaudiod and $(BIN_DIR)/webclient"
 
 ## test: run every test, including the ones that need the capture library
 test: test-lib test-go
@@ -52,11 +52,11 @@ test-go: lib
 
 ## test-lib: run the capture library's own self test against the live audio server
 test-lib: lib
-	$(CAPTURE_BUILD)/wsaudio_selftest
+	$(CAPTURE_BUILD)/webaudio_selftest
 
 ## run: build and start the server
 run: build
-	$(BIN_DIR)/wsaudiod
+	$(BIN_DIR)/webaudiod
 
 ## fmt: format the Go sources
 fmt:
@@ -69,8 +69,8 @@ vet: lib
 ## install: install the library, the headers and the server
 install: build
 	$(CMAKE) --install $(CAPTURE_BUILD) --prefix $(PREFIX)
-	install -Dm755 $(BIN_DIR)/wsaudiod $(DESTDIR)$(PREFIX)/bin/wsaudiod
-	install -Dm755 $(BIN_DIR)/wsclient  $(DESTDIR)$(PREFIX)/bin/wsclient
+	install -Dm755 $(BIN_DIR)/webaudiod $(DESTDIR)$(PREFIX)/bin/webaudiod
+	install -Dm755 $(BIN_DIR)/webclient  $(DESTDIR)$(PREFIX)/bin/webclient
 
 ## clean: remove build outputs
 clean:

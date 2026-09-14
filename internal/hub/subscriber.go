@@ -8,7 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/lovemilk2333/linux-ws-audio/internal/proto"
+	"github.com/lovemilk2333/linux-web-audio/internal/proto"
 )
 
 // Packet is one encoded packet ready to be framed and sent.

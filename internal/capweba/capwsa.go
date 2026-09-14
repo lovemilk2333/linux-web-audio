@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Package capwsa binds the libwsaudio C ABI.
+// Package capweba binds the libwebaudio C ABI.
 //
 // It is the only package that touches C. Everything above it works with Go
 // types, so the rest of the program can be tested without building the capture
 // library — see the note in the README about the build order.
 //
 // The library is linked directly rather than dlopen'ed, which is why the Go
-// build needs capture/build/libwsaudio.so to exist first. Run `make lib`.
-package capwsa
+// build needs capture/build/libwebaudio.so to exist first. Run `make lib`.
+package capweba
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../capture/include
-#cgo LDFLAGS: -L${SRCDIR}/../../capture/build -lwsaudio -Wl,-rpath,${SRCDIR}/../../capture/build
+#cgo LDFLAGS: -L${SRCDIR}/../../capture/build -lwebaudio -Wl,-rpath,${SRCDIR}/../../capture/build
 #include <stdlib.h>
-#include "wsacapture.h"
+#include "webacapture.h"
 */
 import "C"
 
@@ -30,9 +30,9 @@ import (
 type Format int
 
 const (
-	FormatF32LE Format = Format(C.WSA_SAMPLE_F32LE)
-	FormatS16LE Format = Format(C.WSA_SAMPLE_S16LE)
-	FormatS32LE Format = Format(C.WSA_SAMPLE_S32LE)
+	FormatF32LE Format = Format(C.WEBA_SAMPLE_F32LE)
+	FormatS16LE Format = Format(C.WEBA_SAMPLE_S16LE)
+	FormatS32LE Format = Format(C.WEBA_SAMPLE_S32LE)
 )
 
 // String names the format.
@@ -48,18 +48,18 @@ func (f Format) String() string {
 	return fmt.Sprintf("format(%d)", int(f))
 }
 
-// Capture frame flags, mirroring the WSA_FRAME_* constants.
+// Capture frame flags, mirroring the WEBA_FRAME_* constants.
 const (
-	FlagDiscontinuity = uint32(C.WSA_FRAME_DISCONTINUITY)
-	FlagSilence       = uint32(C.WSA_FRAME_SILENCE)
-	FlagUnderrun      = uint32(C.WSA_FRAME_UNDERRUN)
-	FlagReinit        = uint32(C.WSA_FRAME_REINIT)
+	FlagDiscontinuity = uint32(C.WEBA_FRAME_DISCONTINUITY)
+	FlagSilence       = uint32(C.WEBA_FRAME_SILENCE)
+	FlagUnderrun      = uint32(C.WEBA_FRAME_UNDERRUN)
+	FlagReinit        = uint32(C.WEBA_FRAME_REINIT)
 )
 
 // ErrTimeout means no frame was available within the caller's timeout. The
 // capture library synthesizes silence rather than timing out when fixed-rate
 // output is on, so this is unusual in practice.
-var ErrTimeout = errors.New("capwsa: no frame within the timeout")
+var ErrTimeout = errors.New("capweba: no frame within the timeout")
 
 // Error is a failure reported by the capture library.
 type Error struct {
@@ -69,7 +69,7 @@ type Error struct {
 }
 
 func (e *Error) Error() string {
-	msg := fmt.Sprintf("capwsa: %s failed (%s)", e.Op, cString(C.wsa_strerror(C.int(e.Status))))
+	msg := fmt.Sprintf("capweba: %s failed (%s)", e.Op, cString(C.weba_strerror(C.int(e.Status))))
 	if e.Detail != "" {
 		msg += ": " + e.Detail
 	}
@@ -105,10 +105,10 @@ type Config struct {
 	SinkRecheck time.Duration
 }
 
-// DefaultConfig mirrors wsa_config_defaults: 48 kHz, stereo, float32, 20 ms.
+// DefaultConfig mirrors weba_config_defaults: 48 kHz, stereo, float32, 20 ms.
 func DefaultConfig() Config {
-	var cfg C.wsa_config
-	C.wsa_config_defaults(&cfg)
+	var cfg C.weba_config
+	C.weba_config_defaults(&cfg)
 	return Config{
 		SampleRate:   int(cfg.sample_rate),
 		Channels:     int(cfg.channels),
@@ -144,7 +144,7 @@ type Capture struct {
 	// mu guards the handle, so a Close on one goroutine cannot pull the handle
 	// out from under an Info or ReadFrame on another.
 	mu           sync.Mutex
-	ptr          *C.wsa_capture
+	ptr          *C.weba_capture
 	frameSamples int
 	channels     int
 	pcm          []float32
@@ -153,19 +153,19 @@ type Capture struct {
 
 // Version returns the capture library's version string.
 func Version() string {
-	return cString(C.wsa_version_string())
+	return cString(C.weba_version_string())
 }
 
 // Open creates and starts a capture.
 func Open(cfg Config) (*Capture, error) {
 	if cfg.SampleRate <= 0 || cfg.Channels <= 0 || cfg.FrameSamples <= 0 {
-		return nil, fmt.Errorf("capwsa: invalid configuration %+v", cfg)
+		return nil, fmt.Errorf("capweba: invalid configuration %+v", cfg)
 	}
 
-	c := &C.wsa_config{
+	c := &C.weba_config{
 		sample_rate:     C.uint32_t(cfg.SampleRate),
 		channels:        C.uint32_t(cfg.Channels),
-		format:          C.wsa_sample_format(cfg.Format),
+		format:          C.weba_sample_format(cfg.Format),
 		frame_samples:   C.uint32_t(cfg.FrameSamples),
 		ring_frames:     C.uint32_t(cfg.QueueFrames),
 		fixed_rate:      boolToCInt(cfg.FixedRate),
@@ -176,9 +176,9 @@ func Open(cfg Config) (*Capture, error) {
 		defer C.free(unsafe.Pointer(c.sink))
 	}
 
-	var handle *C.wsa_capture
-	if status := C.wsa_capture_create(c, &handle); status != C.WSA_OK {
-		return nil, &Error{Op: "wsa_capture_create", Status: int(status)}
+	var handle *C.weba_capture
+	if status := C.weba_capture_create(c, &handle); status != C.WEBA_OK {
+		return nil, &Error{Op: "weba_capture_create", Status: int(status)}
 	}
 
 	capture := &Capture{
@@ -192,9 +192,9 @@ func Open(cfg Config) (*Capture, error) {
 		pcm: make([]float32, cfg.FrameSamples*cfg.Channels),
 	}
 
-	if status := C.wsa_capture_start(handle); status != C.WSA_OK {
-		err := capture.error("wsa_capture_start", int(status))
-		C.wsa_capture_destroy(handle)
+	if status := C.weba_capture_start(handle); status != C.WEBA_OK {
+		err := capture.error("weba_capture_start", int(status))
+		C.weba_capture_destroy(handle)
 		return nil, err
 	}
 
@@ -209,7 +209,7 @@ func boolToCInt(v bool) C.int {
 }
 
 func (c *Capture) error(op string, status int) error {
-	return &Error{Op: op, Status: status, Detail: cString(C.wsa_capture_last_error(c.ptr))}
+	return &Error{Op: op, Status: status, Detail: cString(C.weba_capture_last_error(c.ptr))}
 }
 
 // ReadFrame waits up to timeout for one frame and returns the interleaved
@@ -221,15 +221,15 @@ func (c *Capture) ReadFrame(timeout time.Duration) ([]float32, FrameInfo, error)
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return nil, FrameInfo{}, errors.New("capwsa: capture is closed")
+		return nil, FrameInfo{}, errors.New("capweba: capture is closed")
 	}
 	// The handle stays valid for the duration of the call because Close cannot
 	// proceed until the lock is released.
 	handle, pcm, frameSamples := c.ptr, c.pcm, c.frameSamples
 	c.mu.Unlock()
 
-	var info C.wsa_frame_info
-	status := C.wsa_capture_read_frame(
+	var info C.weba_frame_info
+	status := C.weba_capture_read_frame(
 		handle,
 		unsafe.Pointer(&pcm[0]),
 		C.uint32_t(frameSamples),
@@ -246,7 +246,7 @@ func (c *Capture) ReadFrame(timeout time.Duration) ([]float32, FrameInfo, error)
 	case 0:
 		return nil, FrameInfo{}, ErrTimeout
 	default:
-		return nil, FrameInfo{}, c.error("wsa_capture_read_frame", int(status))
+		return nil, FrameInfo{}, c.error("weba_capture_read_frame", int(status))
 	}
 }
 
@@ -259,14 +259,14 @@ func (c *Capture) Info() (Info, error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return Info{}, errors.New("capwsa: capture is closed")
+		return Info{}, errors.New("capweba: capture is closed")
 	}
 	handle := c.ptr
 	c.mu.Unlock()
 
-	var raw C.wsa_format_info
-	if status := C.wsa_capture_get_format(handle, &raw); status != C.WSA_OK {
-		return Info{}, c.error("wsa_capture_get_format", int(status))
+	var raw C.weba_format_info
+	if status := C.weba_capture_get_format(handle, &raw); status != C.WEBA_OK {
+		return Info{}, c.error("weba_capture_get_format", int(status))
 	}
 
 	return Info{
@@ -288,7 +288,7 @@ func (c *Capture) Running() bool {
 	}
 	handle := c.ptr
 	c.mu.Unlock()
-	return C.wsa_capture_is_running(handle) != 0
+	return C.weba_capture_is_running(handle) != 0
 }
 
 // Close stops the capture and releases it. Idempotent.
@@ -299,7 +299,7 @@ func (c *Capture) Close() error {
 		return nil
 	}
 	c.closed = true
-	C.wsa_capture_destroy(c.ptr)
+	C.weba_capture_destroy(c.ptr)
 	c.ptr = nil
 	return nil
 }

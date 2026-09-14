@@ -6,7 +6,7 @@
 // Layout (all integers big-endian):
 //
 //	offset  size  field
-//	 0       4    magic "WSAU"
+//	 0       4    magic "WEBU"
 //	 4       1    version
 //	 5       1    flags
 //	 6       2    seq       uint16
@@ -25,8 +25,8 @@ import (
 )
 
 const (
-	// Magic identifies the stream. It is the ASCII string "WSAU".
-	Magic = 0x57534155
+	// Magic identifies the stream. It is the ASCII string "WEBU".
+	Magic = 0x57454255
 	// Version is the current wire format version.
 	Version = 1
 	// HeaderSize is the fixed size of the packet header in bytes.

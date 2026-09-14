@@ -13,7 +13,7 @@ Each packet is a fixed 16-byte header followed by one encoded payload:
 
 ```
 offset  size  field
- 0       4    magic       "WSAU"
+ 0       4    magic       "WEBU"
  4       1    version     1
  5       1    flags
  6       2    seq         uint16

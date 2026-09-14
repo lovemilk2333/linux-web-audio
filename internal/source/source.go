@@ -3,7 +3,7 @@
 // Package source drives the capture library and publishes frames to the hub.
 //
 // It owns the capture handle and the thread that reads from it, converting the
-// capture library's vocabulary (WSA_FRAME_* bits, C status codes) into the
+// capture library's vocabulary (WEBA_FRAME_* bits, C status codes) into the
 // hub's (proto.Flag* bits, Go errors).
 package source
 
@@ -14,9 +14,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lovemilk2333/linux-ws-audio/internal/capwsa"
-	"github.com/lovemilk2333/linux-ws-audio/internal/hub"
-	"github.com/lovemilk2333/linux-ws-audio/internal/proto"
+	"github.com/lovemilk2333/linux-web-audio/internal/capweba"
+	"github.com/lovemilk2333/linux-web-audio/internal/hub"
+	"github.com/lovemilk2333/linux-web-audio/internal/proto"
 )
 
 // Config describes what to capture.
@@ -56,12 +56,12 @@ func (c Config) FrameDuration() time.Duration {
 
 // Source is a running capture feeding a channel of frames.
 type Source struct {
-	capture *capwsa.Capture
+	capture *capweba.Capture
 	frames  chan hub.Frame
 	log     *slog.Logger
 	// info is captured at open time so it stays readable after the capture
 	// handle is released.
-	info capwsa.Info
+	info capweba.Info
 
 	stopOnce sync.Once
 	stopped  chan struct{}
@@ -81,15 +81,15 @@ func Open(cfg Config, logger *slog.Logger) (*Source, error) {
 		logger = slog.Default()
 	}
 
-	libraryCfg := capwsa.DefaultConfig()
+	libraryCfg := capweba.DefaultConfig()
 	libraryCfg.SampleRate = cfg.SampleRate
 	libraryCfg.Channels = cfg.Channels
 	libraryCfg.FrameSamples = cfg.FrameSamples
 	libraryCfg.Sink = cfg.Sink
-	libraryCfg.Format = capwsa.FormatF32LE
+	libraryCfg.Format = capweba.FormatF32LE
 	libraryCfg.FixedRate = true
 
-	capture, err := capwsa.Open(libraryCfg)
+	capture, err := capweba.Open(libraryCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +141,7 @@ func (s *Source) Close() error {
 // It asks the capture library rather than returning what was true at startup,
 // because the capture reopens onto a different sink when the default output
 // device changes and the reported monitor has to follow it.
-func (s *Source) Info() capwsa.Info {
+func (s *Source) Info() capweba.Info {
 	if info, err := s.capture.Info(); err == nil {
 		return info
 	}
@@ -182,7 +182,7 @@ func (s *Source) run(cfg Config) {
 
 		samples, info, err := s.capture.ReadFrame(readTimeout)
 		if err != nil {
-			if errors.Is(err, capwsa.ErrTimeout) {
+			if errors.Is(err, capweba.ErrTimeout) {
 				// The library only reports a timeout when fixed-rate output is
 				// off, so this means a genuine gap rather than silence.
 				s.log.Warn("capture read timed out", "timeout", readTimeout)
@@ -202,7 +202,7 @@ func (s *Source) run(cfg Config) {
 		copy(pcm, samples)
 
 		flags := mapFlags(info.Flags)
-		if info.Flags&capwsa.FlagReinit != 0 {
+		if info.Flags&capweba.FlagReinit != 0 {
 			s.mu.Lock()
 			s.reopens++
 			n := s.reopens
@@ -228,15 +228,15 @@ func (s *Source) recordError(err error) {
 //
 // A reopened stream is reported as a discontinuity: from the listener's point of
 // view the audio is no longer continuous across it, whatever the reason.
-func mapFlags(wsaFlags uint32) uint8 {
+func mapFlags(webaFlags uint32) uint8 {
 	var flags uint8
-	if wsaFlags&capwsa.FlagDiscontinuity != 0 || wsaFlags&capwsa.FlagReinit != 0 {
+	if webaFlags&capweba.FlagDiscontinuity != 0 || webaFlags&capweba.FlagReinit != 0 {
 		flags |= proto.FlagDiscontinuity
 	}
-	if wsaFlags&capwsa.FlagSilence != 0 {
+	if webaFlags&capweba.FlagSilence != 0 {
 		flags |= proto.FlagSilence
 	}
-	if wsaFlags&capwsa.FlagUnderrun != 0 {
+	if webaFlags&capweba.FlagUnderrun != 0 {
 		flags |= proto.FlagUnderrun
 	}
 	return flags

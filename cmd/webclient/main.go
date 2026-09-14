@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Command wsclient is a reference client for the linux-ws-audio stream.
+// Command webclient is a reference client for the linux-web-audio stream.
 //
 // It is deliberately a plain HTTP client: fetch /audio/info, open
 // /audio/stream, read framed packets, and report what arrived. It also
@@ -8,10 +8,10 @@
 // right — disconnect, reconnect with ?from_seq, and check that the missed audio
 // was actually served rather than skipped.
 //
-//	wsclient -duration 5s
-//	wsclient -resume-test -duration 6s
-//	wsclient -codec pcm_s16le -duration 2s
-//	wsclient -out capture.wav -duration 10s
+//	webclient -duration 5s
+//	webclient -resume-test -duration 6s
+//	webclient -codec pcm_s16le -duration 2s
+//	webclient -out capture.wav -duration 10s
 package main
 
 import (
@@ -31,7 +31,7 @@ import (
 	"time"
 
 	"github.com/hraban/opus"
-	"github.com/lovemilk2333/linux-ws-audio/internal/proto"
+	"github.com/lovemilk2333/linux-web-audio/internal/proto"
 )
 
 type options struct {
@@ -48,7 +48,7 @@ type options struct {
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "wsclient: %v\n", err)
+		fmt.Fprintf(os.Stderr, "webclient: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -77,7 +77,7 @@ func run() error {
 
 	token := opts.token
 	if token == "" {
-		token = os.Getenv("WSA_TOKEN")
+		token = os.Getenv("WEBA_TOKEN")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

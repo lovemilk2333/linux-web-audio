@@ -1,25 +1,25 @@
-# systemd user unit for wsaudiod.
+# systemd user unit for webaudiod.
 #
 # It must run as the user, not as a system service: capture goes through the
 # user's PipeWire/PulseAudio session socket under $XDG_RUNTIME_DIR, which a
 # system service cannot reach.
 #
-#   install -Dm644 deploy/wsaudiod.service ~/.config/systemd/user/wsaudiod.service
+#   install -Dm644 deploy/webaudiod.service ~/.config/systemd/user/webaudiod.service
 #   systemctl --user daemon-reload
-#   systemctl --user enable --now wsaudiod
+#   systemctl --user enable --now webaudiod
 #
 # If the server should also run while nobody is logged in, enable lingering:
 #   loginctl enable-linger "$USER"
 
 [Unit]
 Description=Desktop audio over HTTP
-Documentation=https://github.com/lovemilk2333/linux-ws-audio
+Documentation=https://github.com/lovemilk2333/linux-web-audio
 After=pipewire.service pipewire-pulse.service wireplumber.service
 Wants=pipewire.service
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/wsaudiod --listen 127.0.0.1:8642 --codec opus
+ExecStart=%h/.local/bin/webaudiod --listen 127.0.0.1:8642 --codec opus
 
 # The audio session socket is what this service exists to reach. Without it the
 # unit can start before the session bus is ready and fail to connect.

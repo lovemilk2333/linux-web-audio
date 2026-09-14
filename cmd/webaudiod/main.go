@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Command wsaudiod captures desktop audio and streams it over HTTP.
+// Command webaudiod captures desktop audio and streams it over HTTP.
 //
 // The stream is a long-lived chunked response: a sequence of 16-byte headers
 // each followed by one encoded packet. GET /audio/info describes the stream and
@@ -22,11 +22,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/lovemilk2333/linux-ws-audio/internal/capwsa"
-	"github.com/lovemilk2333/linux-ws-audio/internal/codec"
-	"github.com/lovemilk2333/linux-ws-audio/internal/hub"
-	"github.com/lovemilk2333/linux-ws-audio/internal/server"
-	"github.com/lovemilk2333/linux-ws-audio/internal/source"
+	"github.com/lovemilk2333/linux-web-audio/internal/capweba"
+	"github.com/lovemilk2333/linux-web-audio/internal/codec"
+	"github.com/lovemilk2333/linux-web-audio/internal/hub"
+	"github.com/lovemilk2333/linux-web-audio/internal/server"
+	"github.com/lovemilk2333/linux-web-audio/internal/source"
 )
 
 type options struct {
@@ -50,7 +50,7 @@ type options struct {
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "wsaudiod: %v\n", err)
+		fmt.Fprintf(os.Stderr, "webaudiod: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -74,7 +74,7 @@ func run() error {
 	flag.IntVar(&opts.clientQueue, "client-queue", 64, "packets buffered per client before the slow-client policy applies")
 	flag.StringVar(&opts.slowClient, "slow-client", "fast-forward",
 		"what to do with a client that falls behind: fast-forward, drop or disconnect")
-	flag.StringVar(&opts.token, "token", "", "require this bearer token on every request (or set WSA_TOKEN)")
+	flag.StringVar(&opts.token, "token", "", "require this bearer token on every request (or set WEBA_TOKEN)")
 	flag.BoolVar(&opts.vbr, "vbr", false, "use variable bitrate where supported (Opus runs in constant bitrate by default, as Sunshine does)")
 	flag.BoolVar(&opts.dtx, "dtx", false, "enable discontinuous transmission where supported")
 	flag.BoolVar(&opts.fec, "fec", false, "enable in-band forward error correction where supported")
@@ -84,7 +84,7 @@ func run() error {
 	flag.Parse()
 
 	if *version {
-		fmt.Printf("wsaudiod %s (capture library %s)\n", server.Version, capwsa.Version())
+		fmt.Printf("webaudiod %s (capture library %s)\n", server.Version, capweba.Version())
 		return nil
 	}
 
@@ -160,7 +160,7 @@ func run() error {
 		Source:         src,
 		Token:          token,
 		Codecs:         codecNames,
-		CaptureLibrary: capwsa.Version(),
+		CaptureLibrary: capweba.Version(),
 		Log:            logger,
 		StartedAt:      time.Now(),
 	})
@@ -246,7 +246,7 @@ func resolveToken(flagValue string) (string, error) {
 	if flagValue != "" {
 		return flagValue, nil
 	}
-	return os.Getenv("WSA_TOKEN"), nil
+	return os.Getenv("WEBA_TOKEN"), nil
 }
 
 func newLogger(level string) (*slog.Logger, error) {
