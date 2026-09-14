@@ -44,6 +44,10 @@ type Config struct {
 	// sit beside a web page on the same origin and be proxied without
 	// rewriting. Empty or "/" mounts at the root.
 	BasePath string
+	// Listen is the address being served, used to seed the Host allow-list.
+	Listen string
+	// AllowedHosts are extra Host names to answer to, or "*" to accept any.
+	AllowedHosts []string
 	// CORSOrigins lists the origins allowed to call the API from a browser.
 	// Empty disables CORS, which is the default: a separately served page is a
 	// cross-origin client and cannot work without this.
@@ -54,10 +58,11 @@ type Config struct {
 
 // Server implements http.Handler.
 type Server struct {
-	cfg      Config
-	mux      *http.ServeMux
-	cors     corsPolicy
-	basePath string
+	cfg       Config
+	mux       *http.ServeMux
+	cors      corsPolicy
+	basePath  string
+	hostGuard hostGuard
 }
 
 // New builds the HTTP handler. The returned handler applies authentication when
@@ -67,7 +72,17 @@ func New(cfg Config) http.Handler {
 		cfg.Log = slog.Default()
 	}
 
-	s := &Server{cfg: cfg, mux: http.NewServeMux(), cors: newCORSPolicy(cfg.CORSOrigins)}
+	guard, err := NewHostGuard(cfg.Listen, cfg.AllowedHosts)
+	if err != nil {
+		panic(err)
+	}
+
+	s := &Server{
+		cfg:       cfg,
+		mux:       http.NewServeMux(),
+		cors:      newCORSPolicy(cfg.CORSOrigins),
+		hostGuard: guard,
+	}
 
 	base, err := NormaliseBasePath(cfg.BasePath)
 	if err != nil {
@@ -82,10 +97,12 @@ func New(cfg Config) http.Handler {
 	s.mux.HandleFunc("GET "+base+"/audio/stream", s.handleStream)
 	s.mux.HandleFunc("GET "+base+"/healthz", s.handleHealth)
 
-	// CORS is outermost: a browser sends its preflight without the
-	// Authorization header, so it has to be answered before the auth check.
-	// Health stays outside the auth check so a probe needs no secret.
-	return s.withCORS(s.authenticate(s.mux))
+	// The Host check is outermost: a request arriving under a name this server
+	// does not answer to is refused before it is parsed or answered at all.
+	// Then CORS, which a browser sends its preflight for without the
+	// Authorization header. Health stays outside the auth check so a probe
+	// needs no secret.
+	return s.withHostGuard(s.withCORS(s.authenticate(s.mux)))
 }
 
 // NormaliseBasePath validates a base path and returns it in the form the mux

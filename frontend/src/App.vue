@@ -18,7 +18,6 @@ const STORAGE_KEY = 'linux-web-audio:settings'
 
 interface Settings {
   baseUrl: string
-  token: string
   codec: string
   /**
    * Buffer target in milliseconds, or null to follow the stream's minimum.
@@ -38,7 +37,6 @@ function loadSettings(): Settings {
      * proxy provides and what a deployment behind a reverse proxy looks like.
      * Point it at a host:port to reach a server directly instead. */
     baseUrl: '',
-    token: '',
     codec: '',
     // Lowest latency by default. The floor is where the audio thread stops
     // dropping blocks, so this is as current as the stream can be.
@@ -50,15 +48,32 @@ function loadSettings(): Settings {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (!raw) return defaults
+
+    const stored = JSON.parse(raw) as Partial<Settings> & { token?: string }
+    if (stored.token) {
+      // Earlier versions persisted the token here. Drop it rather than leave a
+      // secret sitting in storage for a page that no longer reads it.
+      delete stored.token
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(stored))
+    }
+
     // Merged over the defaults so a settings object written by an older
     // version does not leave a field undefined.
-    return { ...defaults, ...(JSON.parse(raw) as Partial<Settings>) }
+    return { ...defaults, ...stored }
   } catch {
     return defaults
   }
 }
 
 const settings = reactive<Settings>(loadSettings())
+
+/* Deliberately not part of `settings` and never written to storage.
+ *
+ * A bearer token in localStorage is readable by any script on this origin —
+ * one XSS, or a malicious extension, and the secret protecting a live feed of
+ * everything this machine plays is gone. It is retyped after a reload, which is
+ * the cost of not leaving it lying around. */
+const token = ref('')
 
 const state = ref<StreamState>('idle')
 const info = shallowRef<ServerInfo | null>(null)
@@ -179,7 +194,18 @@ watch(
     window.clearTimeout(saveTimer)
     saveTimer = window.setTimeout(() => {
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(settings))
+        // Explicitly fields, not the reactive object: this is what guarantees
+        // no secret can reach storage even if one is added to the type later.
+        localStorage.setItem(
+          STORAGE_KEY,
+          JSON.stringify({
+            baseUrl: settings.baseUrl,
+            codec: settings.codec,
+            targetMs: settings.targetMs,
+            resume: settings.resume,
+            theme: settings.theme,
+          }),
+        )
       } catch {
         // Storage can be full or blocked; the page still works without it.
       }
@@ -269,7 +295,7 @@ onBeforeUnmount(() => {
 })
 
 async function refreshInfo(): Promise<ServerInfo> {
-  const fetched = await fetchInfo(settings.baseUrl, settings.token)
+  const fetched = await fetchInfo(settings.baseUrl, token.value)
   info.value = fetched
 
   // An explicit choice can fall outside what this server allows: a longer
@@ -374,7 +400,7 @@ async function connect({ reconnecting = false } = {}): Promise<void> {
     reader = new StreamReader({
       baseUrl: settings.baseUrl,
       codec: activeCodec,
-      token: settings.token,
+      token: token.value,
       resume: settings.resume,
       resumeFrom,
       onFrame: (frame) => {
@@ -484,7 +510,7 @@ function dropConnection(): void {
       <div class="column">
         <ConnectionPanel
           v-model:base-url="settings.baseUrl"
-          v-model:token="settings.token"
+          v-model:token="token"
           v-model:codec="settings.codec"
           :state="state"
           :info="info"

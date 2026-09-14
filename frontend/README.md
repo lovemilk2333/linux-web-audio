@@ -109,6 +109,12 @@ client can only know by checking:
 | replayed | packets served from the server's history after a resume |
 | gaps flagged | the server itself reported a discontinuity |
 
+**The token is not saved.** It is held in memory for the session and retyped
+after a reload. `localStorage` is readable by any script on the origin, so one
+XSS or a malicious extension would otherwise hand over the secret protecting a
+live feed of everything the machine plays. A version that persisted it will
+have it stripped on next load.
+
 `window.__webaudio` exposes the same state live, for the console:
 
 ```js

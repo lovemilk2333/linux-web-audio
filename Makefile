@@ -14,6 +14,13 @@ BUILD_TYPE ?= Release
 
 CAPTURE_REPO := https://github.com/lovemilk2333/linux-web-audio-capture
 
+# The tests link the capture library through cgo, so the loader has to find it
+# at run time as well as the compiler at build time. pkg-config already knows
+# where it was installed, so this saves every `go test` needing the caller to
+# remember LD_LIBRARY_PATH.
+CAPTURE_LIBDIR := $(shell pkg-config --variable=libdir webacapture 2>/dev/null)
+export LD_LIBRARY_PATH := $(CAPTURE_LIBDIR)$(if $(LD_LIBRARY_PATH),:$(LD_LIBRARY_PATH))
+
 .PHONY: all build check-lib test run fmt vet install clean help
 
 all: build

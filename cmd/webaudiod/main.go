@@ -43,8 +43,13 @@ type options struct {
 	clientQueue    int
 	slowClient     string
 	token          string
+	tokenFile      string
 	cors           string
 	basePath       string
+	allowedHosts   string
+	allowAnonymous bool
+	tlsCert        string
+	tlsKey         string
 	vbr            bool
 	dtx            bool
 	fec            bool
@@ -77,7 +82,17 @@ func run() error {
 	flag.IntVar(&opts.clientQueue, "client-queue", 64, "packets buffered per client before the slow-client policy applies")
 	flag.StringVar(&opts.slowClient, "slow-client", "fast-forward",
 		"what to do with a client that falls behind: fast-forward, drop or disconnect")
-	flag.StringVar(&opts.token, "token", "", "require this bearer token on every request (or set WEBA_TOKEN)")
+	flag.StringVar(&opts.token, "token", "",
+		"require this bearer token on every request. Visible in the process list, so prefer "+
+			"WEBA_TOKEN or --token-file on a shared machine")
+	flag.StringVar(&opts.tokenFile, "token-file", "",
+		"read the bearer token from this file instead of argv or the environment")
+	flag.StringVar(&opts.allowedHosts, "allowed-hosts", "",
+		"extra Host names to answer to, comma separated, or * to accept any. Loopback names are "+
+			"always accepted; a wildcard --listen cannot guess the rest, so name them here")
+	flag.BoolVar(&opts.allowAnonymous, "allow-anonymous", false,
+		"permit binding beyond loopback with no token. Anyone who can reach the port can then "+
+			"listen to this machine's audio")
 	flag.StringVar(&opts.basePath, "base-path", "/backend",
 		"prefix every endpoint is mounted under, so the API can sit beside a web page on one origin. Empty mounts at the root")
 	flag.StringVar(&opts.cors, "cors", "",
@@ -85,6 +100,8 @@ func run() error {
 	flag.BoolVar(&opts.vbr, "vbr", false, "use variable bitrate where supported (Opus runs in constant bitrate by default, as Sunshine does)")
 	flag.BoolVar(&opts.dtx, "dtx", false, "enable discontinuous transmission where supported")
 	flag.BoolVar(&opts.fec, "fec", false, "enable in-band forward error correction where supported")
+	flag.StringVar(&opts.tlsCert, "tls-cert", "", "serve HTTPS with this certificate, paired with --tls-key")
+	flag.StringVar(&opts.tlsKey, "tls-key", "", "serve HTTPS with this private key, paired with --tls-cert")
 	flag.StringVar(&opts.logLevel, "log-level", "info", "log level: debug, info, warning or error")
 
 	version := flag.Bool("version", false, "print the version and exit")
@@ -100,7 +117,7 @@ func run() error {
 		return err
 	}
 
-	token, err := resolveToken(opts.token)
+	token, err := resolveToken(opts.token, opts.tokenFile)
 	if err != nil {
 		return err
 	}
@@ -129,6 +146,20 @@ func run() error {
 		return err
 	}
 
+	allowedHosts, err := server.ParseAllowedHosts(opts.allowedHosts)
+	if err != nil {
+		return err
+	}
+
+	// "*" tells every browser that any site may read the response. There is no
+	// reason for that to be the default, and with no token in front of it any
+	// page the user visits becomes a listener.
+	if token == "" && containsWildcard(corsOrigins) {
+		return fmt.Errorf("--cors * with no token lets any website you visit read this machine's " +
+			"audio. Name the origin instead, for example --cors 'http://localhost:5173', or set " +
+			"a token if the caller genuinely needs access from anywhere")
+	}
+
 	frameSamples, err := frameSamplesFor(opts.sampleRate, opts.frameDuration)
 	if err != nil {
 		return err
@@ -136,7 +167,7 @@ func run() error {
 
 	// Checked before the capture is opened, so a bad address fails immediately
 	// rather than after the audio device has been claimed and released.
-	if err := checkListen(opts.listen, token != "", logger); err != nil {
+	if err := checkListen(opts.listen, token != "", opts.allowAnonymous, logger); err != nil {
 		return err
 	}
 
@@ -196,9 +227,23 @@ func run() error {
 		CaptureLibrary: capweba.Version(),
 		CORSOrigins:    corsOrigins,
 		BasePath:       basePath,
+		Listen:         opts.listen,
+		AllowedHosts:   allowedHosts,
 		Log:            logger,
 		StartedAt:      time.Now(),
 	})
+
+	// TLS is optional but not implied by a token: over plain HTTP the bearer
+	// header and the audio are both readable by anyone on the path, so a token
+	// without TLS is authentication without confidentiality.
+	useTLS := opts.tlsCert != "" || opts.tlsKey != ""
+	if useTLS && (opts.tlsCert == "" || opts.tlsKey == "") {
+		return errors.New("--tls-cert and --tls-key must be given together")
+	}
+	if !useTLS && !isLoopback(hostOf(opts.listen)) {
+		logger.Warn("serving plain HTTP beyond this machine: a token is visible to anyone on the " +
+			"path, so use --tls-cert/--tls-key or terminate TLS in front of this server")
+	}
 
 	httpServer := &http.Server{
 		Addr:    opts.listen,
@@ -207,6 +252,13 @@ func run() error {
 		// write deadline, so only the header read is bounded.
 		ReadHeaderTimeout: 10 * time.Second,
 		BaseContext:       func(net.Listener) context.Context { return ctx },
+	}
+
+	serve := func() error {
+		if useTLS {
+			return httpServer.ListenAndServeTLS(opts.tlsCert, opts.tlsKey)
+		}
+		return httpServer.ListenAndServe()
 	}
 
 	serveErr := make(chan error, 1)
@@ -220,8 +272,9 @@ func run() error {
 			"frame_samples", frameSamples,
 			"frame_duration_ms", opts.frameDuration,
 			"auth", token != "",
+			"tls", useTLS,
 			"cors", opts.cors)
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := serve(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- err
 			return
 		}
@@ -253,6 +306,24 @@ func run() error {
 	return nil
 }
 
+// hostOf returns the host part of a listen address, or the address itself if
+// it has no port.
+func hostOf(addr string) string {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return addr
+}
+
+func containsWildcard(origins []string) bool {
+	for _, origin := range origins {
+		if origin == "*" {
+			return true
+		}
+	}
+	return false
+}
+
 // watchForSecondSignal exits the process if a further signal arrives while the
 // first is being handled.
 func watchForSecondSignal(ctx context.Context, logger *slog.Logger) {
@@ -278,7 +349,7 @@ func watchForSecondSignal(ctx context.Context, logger *slog.Logger) {
 // The address is passed straight to the listener, whose own error for a missing
 // host is "missing port in address" — which sends you looking at the port you
 // did supply. Validating here says what is actually wrong.
-func checkListen(addr string, hasToken bool, logger *slog.Logger) error {
+func checkListen(addr string, hasToken, allowAnonymous bool, logger *slog.Logger) error {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("invalid --listen %q: expected host:port, for example 127.0.0.1:8642, "+
@@ -294,12 +365,19 @@ func checkListen(addr string, hasToken bool, logger *slog.Logger) error {
 	}
 
 	// An empty host means every interface. Anything not loopback is reachable
-	// from the network, which for a stream of the desktop's audio is worth
-	// saying out loud when there is no token in front of it.
-	if !hasToken && !isLoopback(host) {
-		logger.Warn("listening beyond this machine without a token: anyone who can reach this port "+
-			"can listen to this machine's audio; pass --token, or use --listen 127.0.0.1:8642",
-			"address", addr)
+	// from the network, and this serves whatever the desktop is playing — an
+	// open microphone on every call, notification and video. Warning about that
+	// and starting anyway is a fail-open default for a one-flag mistake, so it
+	// stops instead.
+	if !isLoopback(host) && !hasToken {
+		if !allowAnonymous {
+			return fmt.Errorf("refusing to listen on %s without a token: anyone who can reach "+
+				"that port could listen to this machine's audio. Set --token, --token-file or "+
+				"WEBA_TOKEN; use --listen 127.0.0.1:8642 to keep it local; or pass "+
+				"--allow-anonymous if that is genuinely intended", addr)
+		}
+		logger.Warn("listening beyond this machine with no token and --allow-anonymous set: "+
+			"anyone who can reach this port can listen to this machine's audio", "address", addr)
 	}
 	return nil
 }
@@ -343,7 +421,25 @@ func diff(a, b float64) float64 {
 	return b - a
 }
 
-func resolveToken(flagValue string) (string, error) {
+// resolveToken finds the bearer token, preferring sources that do not put it
+// on the command line.
+//
+// --token is the convenient one and the worst: /proc/<pid>/cmdline is readable
+// by every user on the machine, so on a shared host the secret is public while
+// the server runs. The environment is not private either, but it is not in the
+// process list, and a 0600 file is better still.
+func resolveToken(flagValue, fileValue string) (string, error) {
+	if fileValue != "" {
+		raw, err := os.ReadFile(fileValue)
+		if err != nil {
+			return "", fmt.Errorf("reading --token-file: %w", err)
+		}
+		token := strings.TrimSpace(string(raw))
+		if token == "" {
+			return "", fmt.Errorf("--token-file %s is empty", fileValue)
+		}
+		return token, nil
+	}
 	if flagValue != "" {
 		return flagValue, nil
 	}

@@ -144,12 +144,12 @@ is for.
 
 ```
 --listen 127.0.0.1:8642     --base-path /backend      --codec opus
---bitrate 96000
---complexity 5              --frame-duration 20       --sample-rate 48000
---channels 2                --sink ""                 --history-packets 750
---client-queue 64           --slow-client fast-forward
---token ""                  --cors ""                 --vbr --dtx --fec
---log-level info
+--bitrate 96000             --frame-duration 10       --sample-rate 48000
+--complexity 5              --channels 2              --sink ""
+--history-packets 750       --client-queue 64         --slow-client fast-forward
+--token ""                  --token-file ""           --cors ""
+--allowed-hosts ""          --allow-anonymous
+--tls-cert "" --tls-key ""  --vbr --dtx --fec         --log-level info
 ```
 
 Endpoints live under `--base-path`, `/backend` by default, so the API can sit
@@ -175,6 +175,41 @@ while it has a subscriber, so an idle codec costs nothing:
 ./bin/webaudiod --codec opus,pcm_s16le
 ./bin/webclient -codec pcm_s16le -duration 3s    # the known-length codec
 ```
+
+## Security
+
+This serves everything the machine is playing — calls, meetings, notifications,
+media. The defaults are chosen for that, and three of them are refusals rather
+than warnings, because a warning on a one-flag mistake is not a control.
+
+**Loopback is not the same as private.** Binding to `127.0.0.1` keeps other
+machines out, but not the browser of whoever is sitting at this one. A page on
+`attacker.example` can let its DNS expire and re-resolve to `127.0.0.1`; the
+browser then sees one origin, applies no CORS, and can read the stream. The
+giveaway is the `Host` header still naming `attacker.example`, so the server
+refuses any `Host` it does not answer to — loopback names always, plus whatever
+`--allowed-hosts` names for a bind that cannot enumerate itself.
+
+The rest:
+
+- **`--cors *` requires a token.** `*` tells every browser that any site may
+  read the response, so without a token any page the user visits becomes a
+  listener. Name the origin instead, which is what a dev server needs anyway.
+- **Binding beyond loopback without a token refuses to start.** Use `--token`,
+  `--token-file` or `WEBA_TOKEN`. `--allow-anonymous` exists for the case where
+  that is genuinely intended, and says so in the log every time.
+- **Prefer `--token-file` over `--token`.** A flag value is visible in
+  `/proc/<pid>/cmdline` to every user on the machine; the file only puts its
+  path there. `deploy/webaudiod.service` uses an environment file for the same
+  reason.
+- **A token is not confidentiality.** Over plain HTTP the bearer header and the
+  audio are both readable by anyone on the path, so a token alone on an exposed
+  interface is authentication without secrecy. Use `--tls-cert`/`--tls-key`, or
+  terminate TLS in front of the server; it warns when it is serving plain HTTP
+  beyond loopback.
+
+None of this protects against a malicious process already running as your user:
+it can open `/run/user/$UID/pipewire-0` and capture the same audio directly.
 
 ### Serving a browser from another origin
 
