@@ -4,6 +4,7 @@
 # user's PipeWire/PulseAudio session socket under $XDG_RUNTIME_DIR, which a
 # system service cannot reach.
 #
+#   install ./bin/webaudiod ~/.local/bin/webaudiod
 #   install -Dm644 deploy/webaudiod.service ~/.config/systemd/user/webaudiod.service
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now webaudiod
@@ -19,6 +20,7 @@ Wants=pipewire.service
 
 [Service]
 Type=simple
+Environment="PKG_CONFIG_PATH=%h/.local/lib/pkgconfig" "LD_LIBRARY_PATH=%h/.local/lib"
 ExecStart=%h/.local/bin/webaudiod --listen 127.0.0.1:8642 --codec opus
 
 # The audio session socket is what this service exists to reach. Without it the

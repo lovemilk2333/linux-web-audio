@@ -1,0 +1,23 @@
+example.com {
+	# for auth
+	# basic_auth {
+	#     user hashed-password
+	# }
+
+	# website (frontend) root
+	redir /audio /audio/
+	handle_path /audio/* {
+		root * /path/to/website
+		file_server
+	}
+
+	# backend reverse proxy
+	handle_path /backend* {
+		reverse_proxy 127.0.0.1:8642
+	}
+
+	# other root
+	handle {
+		reverse_proxy 127.0.0.1:59090
+	}
+}
