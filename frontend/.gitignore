@@ -4,3 +4,6 @@ test-results/
 playwright-report/
 diag.mjs
 check.mjs
+
+# TypeScript incremental build state
+*.tsbuildinfo
