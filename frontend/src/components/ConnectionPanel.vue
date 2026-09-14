@@ -98,7 +98,7 @@ const warning = computed(() => {
           :value="baseUrl"
           :disabled="connected"
           spellcheck="false"
-          placeholder="this origin, via the proxy"
+          placeholder="current origin"
           @input="emit('update:baseUrl', ($event.target as HTMLInputElement).value)"
         />
       </div>

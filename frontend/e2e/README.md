@@ -17,7 +17,7 @@ pnpm e2e
 
 No `--cors`: the preview server proxies `/backend` to the API, so the page and
 the stream share an origin. The page's Server field is left blank, which means
-"this origin, through the proxy".
+"current origin".
 
 Set `WEBAUDIO_SERVER=http://host:port` to run them against a server directly
 instead — that path does need `--cors`.

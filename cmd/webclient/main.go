@@ -36,6 +36,7 @@ import (
 
 type options struct {
 	baseURL     string
+	basePath    string
 	codec       string
 	duration    time.Duration
 	fromSeq     int
@@ -56,6 +57,8 @@ func main() {
 func run() error {
 	var opts options
 	flag.StringVar(&opts.baseURL, "url", "http://127.0.0.1:8642", "server base URL")
+	flag.StringVar(&opts.basePath, "base-path", "/backend",
+		"the server's --base-path, prepended to every endpoint")
 	flag.StringVar(&opts.codec, "codec", "", "codec to request; empty uses the server's default")
 	flag.DurationVar(&opts.duration, "duration", 5*time.Second, "how long to listen")
 	flag.IntVar(&opts.fromSeq, "from-seq", -1, "resume from this sequence number instead of joining live")
@@ -79,6 +82,10 @@ func run() error {
 	if token == "" {
 		token = os.Getenv("WEBA_TOKEN")
 	}
+
+	// Resolved once, so everything below works against a finished root rather
+	// than reassembling the path at each call site.
+	opts.baseURL = joinURL(opts.baseURL, opts.basePath)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -123,6 +130,17 @@ func run() error {
 		return resumeCheck(ctx, client, opts, token, info, codecName, first)
 	}
 	return nil
+}
+
+// joinURL appends a base path to a server URL, tolerating slashes on either
+// side and an empty path.
+func joinURL(serverURL, basePath string) string {
+	base := strings.TrimRight(strings.TrimSpace(serverURL), "/")
+	path := strings.Trim(basePath, "/")
+	if path == "" {
+		return base
+	}
+	return base + "/" + path
 }
 
 func initialSeq(value int) (*uint16, error) {
