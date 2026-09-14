@@ -41,7 +41,8 @@ GET /audio/stream  (chunked, never ends)
   └─ ReadableStream ── FrameParser ── one 16-byte header + payload per frame
        └─ decoder ──┐
                     ├─ opus      → WebCodecs AudioDecoder
-                    └─ pcm_s16le → nothing, it is already samples
+                    ├─ opus      → opus-decoder (WASM, fetched on demand)
+                    └─ pcm_*     → nothing, it is already samples
             └─ planar float chunks ── postMessage (buffers transferred)
                  └─ AudioWorklet: buffers, plays on the audio clock, meters
 ```
@@ -126,7 +127,7 @@ they produce noise or silence.
 Opus is what makes this cheap to run. Where it cannot be decoded the page falls
 back, but each step down costs bandwidth:
 
-- **Chrome, Edge (desktop and Android), recent Firefox and Safari** — decrypt
+- **Chrome, Edge (desktop and Android), recent Firefox and Safari** — decode
   through WebCodecs. Chrome on Android has had `AudioDecoder` since 94, and
   third-party telemetry reports Opus decoding available in every Android
   Chromium session measured.
