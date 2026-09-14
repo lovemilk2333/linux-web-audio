@@ -32,6 +32,17 @@ export interface PlayerStatus {
   gain: number
   /** Samples clamped at full scale in the last report window (~100 ms). */
   clipped: number
+  /** Times playback stopped to rebuild a buffer that had drained. */
+  refills: number
+  /* Rates, for diagnosing buffer drift: a source and a sink a few tens of ppm
+   * apart drain the buffer forever, and the two numbers are how that is told
+   * apart from the stream simply arriving slowly. */
+  enqueuedFrames: number
+  playedFrames: number
+  contextRate: number
+  streamRate: number
+  /** Frames owed to the drift corrector; near zero when the clocks agree. */
+  correction: number
 }
 
 const IDLE_STATUS: PlayerStatus = {
@@ -45,6 +56,12 @@ const IDLE_STATUS: PlayerStatus = {
   targetMs: 0,
   gain: 1,
   clipped: 0,
+  refills: 0,
+  enqueuedFrames: 0,
+  playedFrames: 0,
+  contextRate: 0,
+  streamRate: 0,
+  correction: 0,
 }
 
 /**
@@ -150,6 +167,12 @@ export class Player {
         targetMs: message.targetMs ?? 0,
         gain: message.gain ?? 1,
         clipped: message.clipped ?? 0,
+        refills: message.refills ?? 0,
+        enqueuedFrames: message.enqueuedFrames ?? 0,
+        playedFrames: message.playedFrames ?? 0,
+        contextRate: message.contextRate ?? 0,
+        streamRate: message.streamRate ?? 0,
+        correction: message.correction ?? 0,
       }
       for (const listener of this.listeners) listener(this.status)
     }

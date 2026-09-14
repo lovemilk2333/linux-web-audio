@@ -45,6 +45,24 @@ class PlayerProcessor extends AudioWorkletProcessor {
     this.playing = false
 
     /**
+     * Frames owed to the drift corrector, fractional.
+     *
+     * Negative means the buffer is short and the reader should repeat a frame;
+     * positive means it is long and one should be skipped. See the correction
+     * at the chunk boundary in process().
+     */
+    this.correction = 0
+
+    /**
+     * How often playback had to stop and rebuild the buffer.
+     *
+     * Not an error, but worth counting: a rising number means the stream is
+     * arriving slower than it plays, which is the one condition this cannot
+     * recover from on its own.
+     */
+    this.refills = 0
+
+    /**
      * True while there is no stream to play.
      *
      * The audio thread is still called, and would otherwise count every block
@@ -73,6 +91,7 @@ class PlayerProcessor extends AudioWorkletProcessor {
     this.underruns = 0
     this.droppedFrames = 0
     this.playedFrames = 0
+    this.enqueuedFrames = 0
     this.peak = 0
     this.silent = true
     this.clipped = 0
@@ -110,6 +129,7 @@ class PlayerProcessor extends AudioWorkletProcessor {
         this.droppedFrames = 0
         this.playedFrames = 0
         this.clipped = 0
+        this.refills = 0
         this.playing = false
         break
       default:
@@ -172,6 +192,7 @@ class PlayerProcessor extends AudioWorkletProcessor {
 
     const arrived = channels[0].length
     this.queue.push(channels)
+    this.enqueuedFrames += arrived
     this.buffered += arrived
     this.trim(arrived)
   }
@@ -202,6 +223,22 @@ class PlayerProcessor extends AudioWorkletProcessor {
     const wanted = output[0].length
     let written = 0
     let peak = 0
+
+    /* Drift correction.
+     *
+     * The audio device and the capture source are separate clocks, both
+     * nominally 48 kHz and actually a few tens of ppm apart. Measured here:
+     * 47999.4 frames arrive per second while 48031.4 are played, so the buffer
+     * drains a packet every fifteen seconds for as long as the page is open.
+     * Queueing cannot fix it — the two sides disagree about how long a second
+     * is — so the reader is nudged instead: short buffer, repeat one frame;
+     * long buffer, skip one.
+     *
+     * Spread over a hundred chunk boundaries a second, a single repeated or
+     * skipped frame is inaudible. The alternative is a 20 ms dropout every
+     * fifteen seconds, which is not. */
+    const errorRatio = (this.buffered - this.targetFrames) / Math.max(1, this.targetFrames)
+    this.correction = Math.max(-4, Math.min(4, this.correction + errorRatio * wanted * 0.001))
 
     if (this.idle && this.buffered === 0) {
       for (let channel = 0; channel < output.length; channel++) output[channel].fill(0)
@@ -270,6 +307,20 @@ class PlayerProcessor extends AudioWorkletProcessor {
       if (this.offset >= head[0].length) {
         this.queue.shift()
         this.offset = 0
+
+        /* At most one frame of correction per boundary, which bounds the
+         * artefact rate no matter how wrong the level is. */
+        if (this.correction >= 1 && this.queue.length > 0 && this.queue[0][0].length > 1) {
+          this.offset = 1
+          this.buffered -= 1
+          this.correction -= 1
+        } else if (this.correction <= -1 && written < wanted && written > 0) {
+          for (let channel = 0; channel < output.length; channel++) {
+            output[channel][written] = output[channel][written - 1]
+          }
+          written += 1
+          this.correction += 1
+        }
       }
     }
 
@@ -279,7 +330,28 @@ class PlayerProcessor extends AudioWorkletProcessor {
       for (let channel = 0; channel < output.length; channel++) {
         output[channel].fill(0, written)
       }
-      if (written === 0) this.underruns++
+
+      if (written === 0) {
+        this.underruns++
+
+        /* The buffer reached nothing, so stop and rebuild it.
+         *
+         * A live source arrives at exactly playback speed, which means a
+         * buffer that has drained can never refill while playing: it stays at
+         * zero for the rest of the session and every later packet is late
+         * against an output that is already starving. One bad moment would
+         * otherwise ratchet the level down permanently.
+         *
+         * Keyed to an actual dropout rather than to a level. A threshold was
+         * the obvious approach and it does not work: packets arrive in bursts
+         * while playback drains continuously, so the level swings several
+         * milliseconds below the target as a matter of course, and any
+         * threshold high enough to catch a drain also catches ordinary jitter.
+         * Measured, a guessed threshold re-armed playback every 220 ms on a
+         * healthy stream. A dropout is a fact; a level is a guess. */
+        this.playing = false
+        this.refills++
+      }
     }
 
     this.peak = Math.max(this.peak, peak)
@@ -312,6 +384,11 @@ class PlayerProcessor extends AudioWorkletProcessor {
       targetMs: this.targetMs,
       gain: this.gain,
       clipped: this.clipped,
+      refills: this.refills,
+      correction: this.correction,
+      enqueuedFrames: this.enqueuedFrames,
+      contextRate: sampleRate,
+      streamRate: this.sampleRate,
     })
 
     /* Both reset each report, so they describe the last window rather than

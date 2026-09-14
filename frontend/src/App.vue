@@ -123,6 +123,12 @@ const playerStatus = reactive<PlayerStatus>({
   targetMs: 0,
   gain: 1,
   clipped: 0,
+  refills: 0,
+  enqueuedFrames: 0,
+  playedFrames: 0,
+  contextRate: 0,
+  streamRate: 0,
+  correction: 0,
 })
 
 /* Bound once for the template. Deliberately not named `location`: that would

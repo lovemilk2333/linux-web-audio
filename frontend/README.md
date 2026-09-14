@@ -90,6 +90,22 @@ range is silence rather than −60 dB, positive gain clamps at full scale rather
 than wrapping, and the meter grows a `clip` badge while that is happening — per
 report window, so it clears again instead of latching on the first loud moment.
 
+**The buffer corrects for clock drift.** The audio device and the capture
+source are separate clocks, both nominally 48 kHz and actually a few tens of
+parts per million apart. Measured on the development machine: 47999.4 frames
+arrive per second while 48031.4 are played, so a buffer of any size drains
+completely and rebuilds roughly every fifteen seconds, for as long as the tab
+is open. Queueing cannot fix it, because the two sides disagree about how long
+a second is. The reader is nudged instead — a short buffer repeats one frame at
+a chunk boundary, a long one skips one — which spreads a correction of about
+thirty frames a second over a hundred boundaries, where it is inaudible. The
+alternative was a 20 ms dropout every fifteen seconds.
+
+The `correction` value in `window.__webaudio.player` shows what the corrector is
+currently doing, and `enqueuedFrames` against `playedFrames` is how the drift
+was found: two rates a few tens of frames apart, rather than a stream arriving
+slowly.
+
 **The buffer is a real jitter buffer.** Playback waits until the target has
 accumulated, then plays continuously; the buffer is topped up as packets arrive
 at playback speed. Starting on the very first packet instead — the obvious
