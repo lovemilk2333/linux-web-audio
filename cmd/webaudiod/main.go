@@ -67,7 +67,7 @@ func run() error {
 		"codec used for clients that do not request one, or a comma-separated list. Supported: "+strings.Join(codec.Names(), ", "))
 	flag.IntVar(&opts.bitrate, "bitrate", 96000, "target bitrate in bits per second, where the codec has one")
 	flag.IntVar(&opts.complexity, "complexity", 5, "encoder effort, where the codec has one")
-	flag.Float64Var(&opts.frameDuration, "frame-duration", 20, "frame duration in ms (Opus accepts 2.5, 5, 10, 20, 40, 60)")
+	flag.Float64Var(&opts.frameDuration, "frame-duration", 10, "frame duration in ms (Opus accepts 2.5, 5, 10, 20, 40, 60)")
 	flag.IntVar(&opts.sampleRate, "sample-rate", 48000, "capture sample rate in Hz")
 	flag.IntVar(&opts.channels, "channels", 2, "capture channel count (1, 2, 6 or 8)")
 	flag.StringVar(&opts.sink, "sink", "",
