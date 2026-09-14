@@ -63,6 +63,25 @@ class PlayerProcessor extends AudioWorkletProcessor {
     this.refills = 0
 
     /**
+     * Audio-thread time when the buffer last sat below the reserve floor, or
+     * 0 if it is currently above it.
+     *
+     * The early-refill safety net waits for this to stay set for a few tens of
+     * milliseconds before stopping playback: a single block below the floor is
+     * ordinary burst jitter, not a drain.
+     */
+    this.lowSince = 0
+
+    /**
+     * Audio-thread time of the most recent refill, early or underrun-driven.
+     *
+     * A cooldown after a rebuild stops a healthy bursty stream from re-arming
+     * every few hundred milliseconds — which is what a plain level threshold
+     * did, and why that approach was abandoned.
+     */
+    this.lastRefillAt = 0
+
+    /**
      * True while there is no stream to play.
      *
      * The audio thread is still called, and would otherwise count every block
@@ -130,6 +149,8 @@ class PlayerProcessor extends AudioWorkletProcessor {
         this.playedFrames = 0
         this.clipped = 0
         this.refills = 0
+        this.lowSince = 0
+        this.lastRefillAt = 0
         this.playing = false
         break
       default:
@@ -236,9 +257,22 @@ class PlayerProcessor extends AudioWorkletProcessor {
      *
      * Spread over a hundred chunk boundaries a second, a single repeated or
      * skipped frame is inaudible. The alternative is a 20 ms dropout every
-     * fifteen seconds, which is not. */
-    const errorRatio = (this.buffered - this.targetFrames) / Math.max(1, this.targetFrames)
-    this.correction = Math.max(-4, Math.min(4, this.correction + errorRatio * wanted * 0.001))
+     * fifteen seconds, which is not.
+     *
+     * The gain has to be high enough that the steady-state error stays small.
+     * At 0.001 the integrator could only sustain the measured ~32 repeated
+     * frames/s by sitting at |errorRatio| ≈ 0.67 — one third of the target —
+     * so a 100 ms buffer meant ~33 ms and still sawtoothed into underruns.
+     * 0.004 puts the same drift at |errorRatio| ≈ 0.17, about 83% of target.
+     *
+     * Below half the target the shortfall is counted twice, so the reader
+     * spends its one-frame-per-boundary budget recovering reserve instead of
+     * hovering near empty. That band never stops playback; it only shapes
+     * the corrector. */
+    const target = Math.max(1, this.targetFrames)
+    const ratio = this.buffered / target
+    const errorRatio = ratio >= 0.5 ? ratio - 1 : (ratio - 1) * 2
+    this.correction = Math.max(-4, Math.min(4, this.correction + errorRatio * wanted * 0.004))
 
     if (this.idle && this.buffered === 0) {
       for (let channel = 0; channel < output.length; channel++) output[channel].fill(0)
@@ -351,7 +385,34 @@ class PlayerProcessor extends AudioWorkletProcessor {
          * healthy stream. A dropout is a fact; a level is a guess. */
         this.playing = false
         this.refills++
+        this.lastRefillAt = currentTime
+        this.lowSince = 0
       }
+    }
+
+    /* Early refill safety net.
+     *
+     * The corrector is what holds the level; this only fires when the buffer
+     * has already fallen to about one render quantum (~4 ms) and stayed there
+     * for tens of milliseconds. That is far below ordinary burst depth on any
+     * sane target, so it does not revive the ~220 ms thrashing of a level
+     * threshold near the setpoint. A one-second cooldown after any refill is
+     * the other half of that defence. */
+    const reserveFloor = Math.max(wanted, Math.round(this.sampleRate * 0.004))
+    if (this.playing && this.buffered > 0 && this.buffered < reserveFloor) {
+      if (this.lowSince === 0) {
+        this.lowSince = currentTime
+      } else if (
+        currentTime - this.lowSince >= 0.05 &&
+        currentTime - this.lastRefillAt >= 1.0
+      ) {
+        this.playing = false
+        this.refills++
+        this.lastRefillAt = currentTime
+        this.lowSince = 0
+      }
+    } else {
+      this.lowSince = 0
     }
 
     this.peak = Math.max(this.peak, peak)

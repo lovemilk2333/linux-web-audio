@@ -34,8 +34,9 @@ const emit = defineEmits<{
         <p class="hint">
           How much audio to hold before playing starts. This is also the delay you hear: the buffer
           cannot fill faster than the source produces it, so a live stream always lags by roughly
-          this much. More absorbs jitter and stalls; less gets you closer to live. Past twice this,
-          the oldest audio is discarded to keep the delay from growing.
+          this much. The worklet steers toward this level and keeps reserve under it, so ordinary
+          jitter does not drain the buffer to nothing. More absorbs stalls; less gets you closer to
+          live. Past twice this, the oldest audio is discarded to keep the delay from growing.
         </p>
         <p class="hint detail">
           The step is one frame and the floor is {{ minTargetMs }} ms here, which is the default:
