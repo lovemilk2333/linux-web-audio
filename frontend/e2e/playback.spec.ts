@@ -5,9 +5,8 @@ import { expect, test, type Page } from '@playwright/test'
 /**
  * End-to-end checks against a live server.
  *
- * These need webaudiod running with --cors for the preview origin, and a live
- * audio session. See e2e/README.md. They are excluded from `pnpm test` for
- * that reason.
+ * These need webaudiod running and a live audio session. See e2e/README.md.
+ * They are excluded from `pnpm test` for that reason.
  *
  * What they cover is the part unit tests cannot reach: that the page talks to
  * the real server, that WebCodecs decodes what the server actually sends, and
@@ -16,7 +15,14 @@ import { expect, test, type Page } from '@playwright/test'
  * text, so a formatting change cannot make a passing test meaningless.
  */
 
-const SERVER = process.env.WEBAUDIO_SERVER ?? 'http://127.0.0.1:8642'
+/**
+ * Blank: the page's own origin.
+ *
+ * Playwright's webServer runs `vite preview`, which forwards /backend to the
+ * API, so the page and the stream share an origin and the API needs no --cors
+ * for these tests. Set WEBAUDIO_SERVER to point them at a server directly.
+ */
+const SERVER = process.env.WEBAUDIO_SERVER ?? ''
 
 /** The shape of window.__webaudio, as App.vue exposes it. */
 interface PageState {
@@ -35,6 +41,8 @@ interface PageState {
   player: { playing: boolean; underruns: number; bufferedMs: number; playedMs: number }
   events: { kind: string; message: string; missing?: number }[]
   error: string | null
+  /** The buffer target in force, in milliseconds. */
+  targetMs: number
 }
 
 declare global {
@@ -111,21 +119,27 @@ test.describe('playback', () => {
 
   // A real-time source cannot outrun playback, so the buffer level is a direct
   // read on whether the page is keeping up.
-  test('holds the buffer at its target without dropping out', async ({ page }) => {
+  test('settles at its buffer target without dropping out', async ({ page }) => {
     await page.goto('/')
     await connect(page)
     await waitForPlayback(page, 2)
 
+    const target = await page.evaluate(() => window.__webaudio.targetMs)
+    // A fresh visit follows the minimum for the stream, which is well under a
+    // tenth of a second. Asserting a fixed threshold would test the default
+    // rather than the behaviour.
+    expect(target, 'a target is in force').toBeGreaterThan(0)
+
     await expect
       .poll(async () => (await state(page)).player.bufferedMs, {
         timeout: 20_000,
-        message: 'the buffer never reached its target',
+        message: `the buffer never approached its ${target} ms target`,
       })
-      .toBeGreaterThan(100)
+      .toBeGreaterThan(target * 0.5)
 
     const current = await state(page)
     expect(current.player.underruns, 'playback dropouts').toBeLessThanOrEqual(1)
-    expect(current.player.bufferedMs, 'buffer level').toBeLessThan(1500)
+    expect(current.player.bufferedMs, 'buffer level').toBeLessThan(target * 4 + 500)
   })
 
   test('resumes after a dropped connection, with no gap', async ({ page }) => {

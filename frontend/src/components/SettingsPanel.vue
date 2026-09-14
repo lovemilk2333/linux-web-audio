@@ -33,7 +33,8 @@ const emit = defineEmits<{
           the oldest audio is discarded to keep the delay from growing.
         </p>
         <p class="hint detail">
-          The step is one frame and the floor is {{ minTargetMs }} ms here. Audio arrives a frame at
+          The step is one frame and the floor is {{ minTargetMs }} ms here, which is the default:
+          as current as the stream can be without dropping blocks. Audio arrives a frame at
           a time, so a smaller step asks for a fraction of a packet; and the audio thread is handed
           128-sample blocks, so a buffer of only a frame or two cannot cover a block plus the wait
           for the next packet — and every packet is decoded on the main thread before it reaches

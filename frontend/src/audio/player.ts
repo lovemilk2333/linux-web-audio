@@ -129,6 +129,8 @@ export class Player {
 
     this.context = context
     this.node = node
+    // A fresh graph starts idle until the caller says otherwise.
+    node.port.postMessage({ type: 'idle', idle: true })
     return context.sampleRate
   }
 
@@ -144,6 +146,16 @@ export class Player {
   /** Changes how much audio to hold, trading latency against dropouts. */
   setTargetMs(targetMs: number): void {
     this.node?.port.postMessage({ type: 'target', targetMs })
+  }
+
+  /**
+   * Marks the player as having nothing to play.
+   *
+   * Without this, every block during a disconnect counts as a dropout, which
+   * reads as a fault when it is only the absence of a stream.
+   */
+  setIdle(idle: boolean): void {
+    this.node?.port.postMessage({ type: 'idle', idle })
   }
 
   /** Clears queued audio and the counters. */

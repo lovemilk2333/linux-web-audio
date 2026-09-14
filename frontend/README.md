@@ -3,36 +3,44 @@
 A browser player and monitor for the stream. It connects to an HTTP long
 connection, decodes what arrives, and plays it through an AudioWorklet.
 
-No server code lives here: this is a static page. It reaches the API over the
-network, which means **the server needs `--cors`** for wherever this page is
-served from.
+No server code lives here: this is a static page. The dev and preview servers
+forward `/backend` to the API, so the page and the stream share an origin and
+there is nothing to configure — no CORS, and the Server field can stay blank.
+
+Only a page served from somewhere that is *not* proxying needs `--cors`.
 
 ## Running it
 
 ```sh
 pnpm install
+pnpm dev            # http://127.0.0.1:5173, proxying /backend to the API
 
-# against the dev server
-pnpm dev            # http://127.0.0.1:5173
-
-# or build and serve the static output
-pnpm build
-pnpm preview        # http://127.0.0.1:4173
+pnpm build          # or build the static output and serve it
+pnpm preview        # http://127.0.0.1:4173, also proxying
 ```
 
-Start the API with the page's origin allowed:
+Start the API separately, on its defaults:
 
 ```sh
-webaudiod --cors 'http://127.0.0.1:5173'      # or :4173 for preview, or *
+webaudiod           # serves /backend on 127.0.0.1:8642
 ```
 
-Origins must have a scheme and no trailing slash. A mistake there produces no
-error at all — the browser simply refuses the request and the page reports a
-network failure.
+That is the whole setup: the dev server forwards `/backend` to
+`127.0.0.1:8642`, so the page and the stream are same-origin. Point
+`WEBAUDIO_API` elsewhere if your server is:
 
-The server address is a field on the page and defaults to
-`<current host>:8642`, so serving the page from the same machine needs no
-configuration.
+```sh
+WEBAUDIO_API=http://192.168.1.5:8642 pnpm dev
+```
+
+Leave the page's **Server** field blank to use that proxy. Fill it in to reach
+an API directly instead — a different host, or one with no proxy in front.
+When the API is on another origin the browser needs `--cors` on the server, and
+a mistake there produces no error at all: the browser simply refuses the
+request and the page reports a network failure.
+
+The API lives under a base path, `/backend` by default, matching the server's
+`--base-path`. Set `VITE_API_BASE` at build time if you changed it.
 
 ## How it works
 

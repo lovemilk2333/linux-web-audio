@@ -44,6 +44,15 @@ class PlayerProcessor extends AudioWorkletProcessor {
      */
     this.playing = false
 
+    /**
+     * True while there is no stream to play.
+     *
+     * The audio thread is still called, and would otherwise count every block
+     * as a dropout — which is what a deliberate disconnect looks like. Silence
+     * with nothing to play is not a fault.
+     */
+    this.idle = true
+
     /** Queued chunks, each an array of Float32Array, one per channel. */
     this.queue = []
     /** Read offset into queue[0]. */
@@ -75,6 +84,9 @@ class PlayerProcessor extends AudioWorkletProcessor {
         break
       case 'target':
         this.setTarget(message.targetMs)
+        break
+      case 'idle':
+        this.idle = message.idle === true
         break
       case 'reset':
         this.queue = []
@@ -175,6 +187,13 @@ class PlayerProcessor extends AudioWorkletProcessor {
     const wanted = output[0].length
     let written = 0
     let peak = 0
+
+    if (this.idle && this.buffered === 0) {
+      for (let channel = 0; channel < output.length; channel++) output[channel].fill(0)
+      this.playing = false
+      this.report(wanted)
+      return true
+    }
 
     if (!this.playing) {
       if (this.buffered < this.targetFrames) {

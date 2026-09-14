@@ -55,6 +55,8 @@ export default defineConfig({
     // Pinned to IPv4. Left to itself vite preview binds [::1] only, and a
     // browser reaching 127.0.0.1 then finds nothing listening.
     command: `pnpm exec vite preview --host 127.0.0.1 --port ${PORT} --strictPort`,
+    // The preview server proxies /backend to the API, so the tests need no
+    // --cors on the server: everything is one origin.
     port: PORT,
     reuseExistingServer: true,
     stdout: 'ignore',

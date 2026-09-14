@@ -44,6 +44,7 @@ type options struct {
 	slowClient     string
 	token          string
 	cors           string
+	basePath       string
 	vbr            bool
 	dtx            bool
 	fec            bool
@@ -77,6 +78,8 @@ func run() error {
 	flag.StringVar(&opts.slowClient, "slow-client", "fast-forward",
 		"what to do with a client that falls behind: fast-forward, drop or disconnect")
 	flag.StringVar(&opts.token, "token", "", "require this bearer token on every request (or set WEBA_TOKEN)")
+	flag.StringVar(&opts.basePath, "base-path", "/backend",
+		"prefix every endpoint is mounted under, so the API can sit beside a web page on one origin. Empty mounts at the root")
 	flag.StringVar(&opts.cors, "cors", "",
 		"origins allowed to call this API from a browser, comma separated, or * for any. A separately served web page needs this")
 	flag.BoolVar(&opts.vbr, "vbr", false, "use variable bitrate where supported (Opus runs in constant bitrate by default, as Sunshine does)")
@@ -117,6 +120,11 @@ func run() error {
 	}
 
 	corsOrigins, err := server.ParseCORSOrigins(opts.cors)
+	if err != nil {
+		return err
+	}
+
+	basePath, err := server.NormaliseBasePath(opts.basePath)
 	if err != nil {
 		return err
 	}
@@ -167,6 +175,16 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	/* A second signal exits at once.
+	 *
+	 * The first asks for a graceful stop, which waits for open connections to
+	 * finish — and a client streaming audio holds one open for as long as it
+	 * likes. Pressing Ctrl+C again is how anyone insists, and having it do
+	 * nothing while the process looks stuck is worse than exiting abruptly.
+	 * Shutdown has already closed the listening socket by then, so the port is
+	 * free either way. */
+	watchForSecondSignal(ctx, logger)
+
 	runErr := make(chan error, 1)
 	go func() { runErr <- broadcast.Run(ctx, src) }()
 
@@ -177,6 +195,7 @@ func run() error {
 		Codecs:         codecNames,
 		CaptureLibrary: capweba.Version(),
 		CORSOrigins:    corsOrigins,
+		BasePath:       basePath,
 		Log:            logger,
 		StartedAt:      time.Now(),
 	})
@@ -194,6 +213,7 @@ func run() error {
 	go func() {
 		logger.Info("listening",
 			"address", opts.listen,
+			"base_path", basePath,
 			"codec", codecNames[0],
 			"sample_rate", opts.sampleRate,
 			"channels", opts.channels,
@@ -220,15 +240,36 @@ func run() error {
 		}
 		return nil
 	case <-ctx.Done():
-		logger.Info("shutting down")
+		// Said before the wait, because a streaming client keeps a connection
+		// open and the pause that follows can look like a hang.
+		logger.Info("shutting down; press Ctrl+C again to exit without waiting")
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Warn("graceful shutdown did not complete", "error", err)
 	}
 	return nil
+}
+
+// watchForSecondSignal exits the process if a further signal arrives while the
+// first is being handled.
+func watchForSecondSignal(ctx context.Context, logger *slog.Logger) {
+	interrupts := make(chan os.Signal, 1)
+	signal.Notify(interrupts, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-ctx.Done()
+		select {
+		case <-interrupts:
+			logger.Warn("second signal, exiting now rather than waiting for open connections")
+			os.Exit(130) // 128 + SIGINT, the conventional code for this
+		case <-time.After(10 * time.Second):
+			// The graceful path should be long done; stop watching.
+		}
+		signal.Stop(interrupts)
+	}()
 }
 
 // checkListen validates the listen address and warns when it is about to expose

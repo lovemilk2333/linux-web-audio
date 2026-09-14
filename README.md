@@ -26,9 +26,6 @@ cd linux-web-audio-capture
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 cmake --install build --prefix ~/.local
-
-export PKG_CONFIG_PATH=~/.local/lib/pkgconfig
-export LD_LIBRARY_PATH=~/.local/lib
 ```
 
 Installing to `/usr/local` works too, but on Arch pkg-config does not search
@@ -40,6 +37,11 @@ Installing to `/usr/local` works too, but on Arch pkg-config does not search
 git clone https://github.com/lovemilk2333/linux-web-audio
 cd linux-web-audio
 make build
+
+# or the path which stored `linux-web-audio-capture` so
+export PKG_CONFIG_PATH=~/.local/lib/pkgconfig
+export LD_LIBRARY_PATH=~/.local/lib
+
 ./bin/webaudiod
 
 # in another terminal
@@ -71,11 +73,18 @@ pnpm install
 pnpm dev                                   # http://127.0.0.1:5173
 ```
 
-It is served separately from the API, which makes it a cross-origin client, so
-the server needs its origin allowed:
+The dev server forwards `/backend` to the API, so the page and the stream share
+an origin and nothing needs configuring — no `--cors`, no server address:
 
 ```sh
-./bin/webaudiod --cors 'http://127.0.0.1:5173'
+./bin/webaudiod                      # serves /backend by default
+cd frontend && pnpm dev              # proxies /backend to it
+```
+
+Point `WEBAUDIO_API` at another host if the server is not on the default port:
+
+```sh
+WEBAUDIO_API=http://127.0.0.1:9000 pnpm dev
 ```
 
 See [`frontend/README.md`](frontend/README.md).
@@ -133,13 +142,23 @@ is for.
 ## Options
 
 ```
---listen 127.0.0.1:8642     --codec opus              --bitrate 96000
+--listen 127.0.0.1:8642     --base-path /backend      --codec opus
+--bitrate 96000
 --complexity 5              --frame-duration 20       --sample-rate 48000
 --channels 2                --sink ""                 --history-packets 750
 --client-queue 64           --slow-client fast-forward
 --token ""                  --cors ""                 --vbr --dtx --fec
 --log-level info
 ```
+
+Endpoints live under `--base-path`, `/backend` by default, so the API can sit
+beside a web page on one origin:
+
+```
+/backend/audio/info    /backend/audio/stream    /backend/healthz
+```
+
+Pass `--base-path ""` to mount at the root instead.
 
 `--listen` defaults to loopback because this streams what the desktop is
 playing. If you expose it, set `--token`: the server then requires
@@ -156,10 +175,11 @@ while it has a subscriber, so an idle codec costs nothing:
 ./bin/webclient -codec pcm_s16le -duration 3s    # the known-length codec
 ```
 
-### Serving a browser
+### Serving a browser from another origin
 
-A web page served from anywhere other than this server is a cross-origin
-client, so it needs `--cors`:
+Proxying is the easier arrangement — the page and the API on one origin, which
+is what `pnpm dev` sets up. To let a page call the API directly across origins
+instead, allow its origin:
 
 ```sh
 ./bin/webaudiod --cors 'http://localhost:5173'      # or a comma-separated list, or *

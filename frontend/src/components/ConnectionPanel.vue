@@ -92,13 +92,13 @@ const warning = computed(() => {
 
     <div class="fields">
       <div class="field grow">
-        <label for="url">Server</label>
+        <label for="url">Server <span class="optional">blank uses this origin</span></label>
         <input
           id="url"
           :value="baseUrl"
           :disabled="connected"
           spellcheck="false"
-          placeholder="http://127.0.0.1:8642"
+          placeholder="this origin, via the proxy"
           @input="emit('update:baseUrl', ($event.target as HTMLInputElement).value)"
         />
       </div>
@@ -207,6 +207,11 @@ const warning = computed(() => {
 
 .field.grow {
   flex: 1 1 16rem;
+}
+
+.optional {
+  color: var(--faint);
+  font-weight: 400;
 }
 
 .field.codec {

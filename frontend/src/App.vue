@@ -7,6 +7,7 @@ import EventLog, { type LogEntry } from './components/EventLog.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import StatsPanel from './components/StatsPanel.vue'
 
+import { Flag } from './audio/protocol'
 import { chooseCodec, createDecoder, opusPath, type Decoder, type StreamFormat } from './audio/decoder'
 import { Player, type PlayerStatus } from './audio/player'
 import { StreamStats } from './stats'
@@ -19,17 +20,29 @@ interface Settings {
   baseUrl: string
   token: string
   codec: string
-  targetMs: number
+  /**
+   * Buffer target in milliseconds, or null to follow the stream's minimum.
+   *
+   * Null rather than a number because the minimum depends on the frame
+   * duration, which is only known once the server has been asked. Storing a
+   * number here would freeze whatever the last server's floor happened to be.
+   */
+  targetMs: number | null
   resume: boolean
   theme: 'system' | 'light' | 'dark'
 }
 
 function loadSettings(): Settings {
   const defaults: Settings = {
-    baseUrl: `${location.protocol}//${location.hostname}:8642`,
+    /* Empty means this page's own origin, which is what the dev server's
+     * proxy provides and what a deployment behind a reverse proxy looks like.
+     * Point it at a host:port to reach a server directly instead. */
+    baseUrl: '',
     token: '',
     codec: '',
-    targetMs: 300,
+    // Lowest latency by default. The floor is where the audio thread stops
+    // dropping blocks, so this is as current as the stream can be.
+    targetMs: null,
     resume: true,
     theme: 'system',
   }
@@ -57,6 +70,21 @@ const playableCodecs = ref<string[]>([])
 const opusDecodePath = ref<'webcodecs' | 'wasm' | 'none'>('none')
 /** Bumped on a timer so the stats panel re-renders; its data mutates in place. */
 const tick = ref(0)
+/** Replayed packets not decoded, because the buffer already held enough. */
+const skipped = ref(0)
+
+/* Replay accounting, owned by the frame handler.
+ *
+ * A resume delivers the missed audio in one burst, often a second or more at
+ * once. Forwarding all of it would load the main thread — the thread the audio
+ * thread waits on — for audio the player is about to discard, since the buffer
+ * holds the target and no more.
+ *
+ * The budget is counted in frames rather than read from the player's reported
+ * level, because that report arrives every 100 ms while a burst lasts about
+ * 50 ms, so it still describes the state before the burst began. */
+let inReplay = false
+let replayBudgetFrames = 0
 
 const playerStatus = reactive<PlayerStatus>({
   bufferedMs: 0,
@@ -160,10 +188,11 @@ watch(
   { deep: true },
 )
 
-watch(
-  () => settings.targetMs,
-  (ms) => player.setTargetMs(ms),
-)
+/* What the player is actually asked to hold: the user's choice if they made
+ * one, otherwise the minimum for this stream. */
+const effectiveTargetMs = computed(() => settings.targetMs ?? minTargetMs.value)
+
+watch(effectiveTargetMs, (ms) => player.setTargetMs(ms))
 
 watch(
   () => settings.theme,
@@ -205,6 +234,9 @@ onMounted(async () => {
       get error() {
         return error.value
       },
+      get targetMs() {
+        return effectiveTargetMs.value
+      },
     },
   })
 
@@ -240,14 +272,16 @@ async function refreshInfo(): Promise<ServerInfo> {
   const fetched = await fetchInfo(settings.baseUrl, settings.token)
   info.value = fetched
 
-  // A stored setting can fall outside what this server's frame size allows: a
-  // longer frame duration moves the floor up, and any duration can move the
-  // step, so a value from a previous session may no longer land on one.
-  const step = fetched.frame_duration_ms > 0 ? fetched.frame_duration_ms : 20
-  const blockMs = ((6 * RENDER_QUANTUM) / (fetched.sample_rate || 48000)) * 1000
-  const floor = Math.ceil(Math.max(step * 2, blockMs) / step) * step
-  const snapped = Math.round(settings.targetMs / step) * step
-  settings.targetMs = Math.max(snapped, floor)
+  // An explicit choice can fall outside what this server allows: a longer
+  // frame duration moves the floor up, and any duration moves the step, so a
+  // value from a previous session may no longer land on one. A null follows
+  // the floor by itself and needs nothing doing to it.
+  if (settings.targetMs !== null) {
+    const step = fetched.frame_duration_ms > 0 ? fetched.frame_duration_ms : 20
+    const blockMs = ((6 * RENDER_QUANTUM) / (fetched.sample_rate || 48000)) * 1000
+    const floor = Math.ceil(Math.max(step * 2, blockMs) / step) * step
+    settings.targetMs = Math.max(Math.round(settings.targetMs / step) * step, floor)
+  }
 
   const format: StreamFormat = { sampleRate: fetched.sample_rate, channels: fetched.channels }
 
@@ -296,7 +330,7 @@ async function connect({ reconnecting = false } = {}): Promise<void> {
     // once. Rebuilding it on every reconnect would tear down the buffer and
     // reintroduce the startup gap for no reason.
     if (!player.running) {
-      const rate = await player.start(format, settings.targetMs)
+      const rate = await player.start(format, effectiveTargetMs.value)
       if (rate !== format.sampleRate) {
         log(
           'error',
@@ -309,6 +343,9 @@ async function connect({ reconnecting = false } = {}): Promise<void> {
       stats.value = new StreamStats(fetched.frame_samples)
       stats.value.sampleRate = fetched.sample_rate
       stats.value.start()
+      skipped.value = 0
+      inReplay = false
+      replayBudgetFrames = 0
       player.reset()
     }
 
@@ -342,6 +379,22 @@ async function connect({ reconnecting = false } = {}): Promise<void> {
       resumeFrom,
       onFrame: (frame) => {
         stats.value.observe(frame)
+
+        if (frame.flags & Flag.Catchup) {
+          if (!inReplay) {
+            inReplay = true
+            replayBudgetFrames = Math.round((effectiveTargetMs.value * fetched.sample_rate) / 1000)
+          }
+          if (replayBudgetFrames <= 0) {
+            skipped.value++
+            return
+          }
+          replayBudgetFrames -= fetched.frame_samples
+        } else {
+          // A live packet ends the replay.
+          inReplay = false
+        }
+
         decoder?.decode(frame)
       },
       onEvent: (event) => {
@@ -351,6 +404,8 @@ async function connect({ reconnecting = false } = {}): Promise<void> {
       },
       onState: (next) => {
         state.value = next
+        // While there is no stream, the audio thread has nothing to starve on.
+        player.setIdle(next !== 'streaming')
       },
     })
 
@@ -377,6 +432,7 @@ function disconnect(): void {
   stats.value.stop()
   void player.stop()
   state.value = 'stopped'
+  player.setIdle(true)
   log('closed', 'disconnected')
 }
 
@@ -394,6 +450,7 @@ function dropConnection(): void {
   decoder?.close()
   decoder = null
   state.value = 'stopped'
+  player.setIdle(true)
 
   globalThis.setTimeout(() => {
     void connect({ reconnecting: true })
@@ -439,7 +496,8 @@ function dropConnection(): void {
           @disconnect="disconnect"
         />
         <SettingsPanel
-          v-model:target-ms="settings.targetMs"
+          :target-ms="effectiveTargetMs"
+          @update:target-ms="settings.targetMs = $event"
           :min-target-ms="minTargetMs"
           :target-step-ms="targetStepMs"
           v-model:resume="settings.resume"
@@ -450,7 +508,13 @@ function dropConnection(): void {
       </div>
 
       <div class="column">
-        <StatsPanel :stats="stats" :player="playerStatus" :connected="connected" :tick="tick" />
+        <StatsPanel
+          :stats="stats"
+          :player="playerStatus"
+          :connected="connected"
+          :skipped="skipped"
+          :tick="tick"
+        />
         <EventLog :entries="entries" />
       </div>
     </div>

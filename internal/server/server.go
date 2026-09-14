@@ -40,6 +40,10 @@ type Config struct {
 	Codecs []string
 	// CaptureLibrary is the capture library's version, reported by /audio/info.
 	CaptureLibrary string
+	// BasePath is the prefix every endpoint is mounted under, so the API can
+	// sit beside a web page on the same origin and be proxied without
+	// rewriting. Empty or "/" mounts at the root.
+	BasePath string
 	// CORSOrigins lists the origins allowed to call the API from a browser.
 	// Empty disables CORS, which is the default: a separately served page is a
 	// cross-origin client and cannot work without this.
@@ -50,9 +54,10 @@ type Config struct {
 
 // Server implements http.Handler.
 type Server struct {
-	cfg  Config
-	mux  *http.ServeMux
-	cors corsPolicy
+	cfg      Config
+	mux      *http.ServeMux
+	cors     corsPolicy
+	basePath string
 }
 
 // New builds the HTTP handler. The returned handler applies authentication when
@@ -63,9 +68,19 @@ func New(cfg Config) http.Handler {
 	}
 
 	s := &Server{cfg: cfg, mux: http.NewServeMux(), cors: newCORSPolicy(cfg.CORSOrigins)}
-	s.mux.HandleFunc("GET /audio/info", s.handleInfo)
-	s.mux.HandleFunc("GET /audio/stream", s.handleStream)
-	s.mux.HandleFunc("GET /healthz", s.handleHealth)
+
+	base, err := NormaliseBasePath(cfg.BasePath)
+	if err != nil {
+		// Programmer error rather than a request-time failure: the flag is
+		// validated when it is parsed, so reaching here means a caller
+		// constructed the config directly.
+		panic(err)
+	}
+	s.basePath = base
+
+	s.mux.HandleFunc("GET "+base+"/audio/info", s.handleInfo)
+	s.mux.HandleFunc("GET "+base+"/audio/stream", s.handleStream)
+	s.mux.HandleFunc("GET "+base+"/healthz", s.handleHealth)
 
 	// CORS is outermost: a browser sends its preflight without the
 	// Authorization header, so it has to be answered before the auth check.
@@ -73,9 +88,32 @@ func New(cfg Config) http.Handler {
 	return s.withCORS(s.authenticate(s.mux))
 }
 
+// NormaliseBasePath validates a base path and returns it in the form the mux
+// wants: empty for the root, otherwise "/something" with no trailing slash.
+func NormaliseBasePath(path string) (string, error) {
+	trimmed := strings.Trim(strings.TrimSpace(path), "/")
+	if trimmed == "" {
+		return "", nil
+	}
+	if strings.Contains(trimmed, "//") {
+		return "", fmt.Errorf("invalid base path %q: empty segments", path)
+	}
+	for _, segment := range strings.Split(trimmed, "/") {
+		if segment == "." || segment == ".." {
+			return "", fmt.Errorf("invalid base path %q: relative segments", path)
+		}
+	}
+	return "/" + trimmed, nil
+}
+
+// Path returns the full path of an endpoint, for logs and for /healthz.
+func (s *Server) Path(endpoint string) string {
+	return s.basePath + endpoint
+}
+
 func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.Token == "" || r.URL.Path == "/healthz" {
+		if s.cfg.Token == "" || r.URL.Path == s.Path("/healthz") {
 			next.ServeHTTP(w, r)
 			return
 		}

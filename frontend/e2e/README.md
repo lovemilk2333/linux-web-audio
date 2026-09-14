@@ -6,14 +6,21 @@ of `pnpm test` because they need both.
 ## Running
 
 ```sh
-# 1. a server, with the preview origin allowed
-webaudiod --cors 'http://127.0.0.1:4173' -log-level info
+# 1. a server, on its defaults
+webaudiod -log-level info
 
 # 2. the built page, and the tests
 cd frontend
 pnpm build
 pnpm e2e
 ```
+
+No `--cors`: the preview server proxies `/backend` to the API, so the page and
+the stream share an origin. The page's Server field is left blank, which means
+"this origin, through the proxy".
+
+Set `WEBAUDIO_SERVER=http://host:port` to run them against a server directly
+instead — that path does need `--cors`.
 
 Playwright starts `vite preview` itself; only the API has to be running.
 

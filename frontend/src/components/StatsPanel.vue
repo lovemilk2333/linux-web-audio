@@ -9,6 +9,8 @@ const props = defineProps<{
   stats: StreamStats
   player: PlayerStatus
   connected: boolean
+  /** Replayed packets dropped undecoded because the buffer was already full. */
+  skipped: number
   /** Refreshes the display; the panels are read-only snapshots. */
   tick: number
 }>()
@@ -94,6 +96,13 @@ const health = computed(() => {
 
   if (stats.catchup > 0) {
     items.push({ label: 'replayed', value: `${stats.catchup} packets`, tone: 'ok' })
+  }
+
+  if (props.skipped > 0) {
+    // Not a fault: a replayed backlog larger than the buffer is deliberately
+    // not decoded, so that playback resumes at the live edge instead of a
+    // second behind it.
+    items.push({ label: 'replay skipped', value: `${props.skipped} packets`, tone: 'ok' })
   }
 
   if (stats.silence > 0) {
