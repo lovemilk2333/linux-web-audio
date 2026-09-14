@@ -20,6 +20,10 @@ export interface PlayerStatus {
   playedMs: number
   /** The target the audio thread is actually holding, in milliseconds. */
   targetMs: number
+  /** Linear playback gain currently applied. */
+  gain: number
+  /** Samples clamped at full scale in the last report window (~100 ms). */
+  clipped: number
 }
 
 const IDLE_STATUS: PlayerStatus = {
@@ -31,6 +35,8 @@ const IDLE_STATUS: PlayerStatus = {
   playing: false,
   playedMs: 0,
   targetMs: 0,
+  gain: 1,
+  clipped: 0,
 }
 
 /**
@@ -120,6 +126,8 @@ export class Player {
         playing: message.playing === true,
         playedMs: (message.playedFrames / format.sampleRate) * 1000,
         targetMs: message.targetMs ?? 0,
+        gain: message.gain ?? 1,
+        clipped: message.clipped ?? 0,
       }
       for (const listener of this.listeners) listener(this.status)
     }
@@ -146,6 +154,16 @@ export class Player {
   /** Changes how much audio to hold, trading latency against dropouts. */
   setTargetMs(targetMs: number): void {
     this.node?.port.postMessage({ type: 'target', targetMs })
+  }
+
+  /**
+   * Sets the playback gain as a linear multiplier.
+   *
+   * Applied on the audio thread, so it takes effect on the next block rather
+   * than after a round trip through the graph.
+   */
+  setGain(linear: number): void {
+    this.node?.port.postMessage({ type: 'gain', gain: linear })
   }
 
   /**

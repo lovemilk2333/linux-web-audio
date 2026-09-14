@@ -60,11 +60,22 @@ class PlayerProcessor extends AudioWorkletProcessor {
     /** Frames queued and not yet played. */
     this.buffered = 0
 
+    /**
+     * Playback gain, as a linear multiplier.
+     *
+     * Applied here rather than through a GainNode so the meter below reads
+     * what is actually heard. A node after this one would leave the meter
+     * showing pre-gain levels, which is worse than useless when the whole
+     * point of the control is that the stream is too quiet or too loud.
+     */
+    this.gain = 1
+
     this.underruns = 0
     this.droppedFrames = 0
     this.playedFrames = 0
     this.peak = 0
     this.silent = true
+    this.clipped = 0
     this.quantaSinceReport = 0
 
     this.port.onmessage = (event) => this.receive(event.data)
@@ -85,6 +96,9 @@ class PlayerProcessor extends AudioWorkletProcessor {
       case 'target':
         this.setTarget(message.targetMs)
         break
+      case 'gain':
+        this.gain = Number.isFinite(message.gain) ? message.gain : 1
+        break
       case 'idle':
         this.idle = message.idle === true
         break
@@ -95,6 +109,7 @@ class PlayerProcessor extends AudioWorkletProcessor {
         this.underruns = 0
         this.droppedFrames = 0
         this.playedFrames = 0
+        this.clipped = 0
         this.playing = false
         break
       default:
@@ -211,15 +226,39 @@ class PlayerProcessor extends AudioWorkletProcessor {
       const available = head[0].length - this.offset
       const take = Math.min(available, wanted - written)
 
+      const unity = this.gain === 1
+
       for (let channel = 0; channel < output.length; channel++) {
         // Mono into a stereo output duplicates rather than leaving a silent
         // channel.
         const source = head[Math.min(channel, head.length - 1)]
-        output[channel].set(source.subarray(this.offset, this.offset + take), written)
+        const destination = output[channel]
+
+        if (unity) {
+          destination.set(source.subarray(this.offset, this.offset + take), written)
+          continue
+        }
+
+        for (let i = 0; i < take; i++) {
+          /* Clamped rather than left to wrap or overflow. The Web Audio output
+           * would clamp anyway; doing it here means the meter below and the
+           * clip count describe the samples that are really played. */
+          let sample = source[this.offset + i] * this.gain
+          if (sample > 1) {
+            sample = 1
+            this.clipped++
+          } else if (sample < -1) {
+            sample = -1
+            this.clipped++
+          }
+          destination[written + i] = sample
+        }
       }
 
+      // Metered from channel 0 of the output, which is post-gain and post-clamp
+      // — exactly what reaches the speakers.
       for (let i = 0; i < take; i++) {
-        const sample = Math.abs(head[0][this.offset + i])
+        const sample = Math.abs(output[0][written + i])
         if (sample > peak) peak = sample
       }
 
@@ -271,8 +310,16 @@ class PlayerProcessor extends AudioWorkletProcessor {
       silent: this.silent,
       playing: this.playing,
       targetMs: this.targetMs,
+      gain: this.gain,
+      clipped: this.clipped,
     })
+
+    /* Both reset each report, so they describe the last window rather than
+     * everything since the player started. A cumulative clip count would latch
+     * the indicator on forever the first time gain was too high — and the
+     * useful question is whether it is clipping *now*. */
     this.peak = 0
+    this.clipped = 0
   }
 }
 

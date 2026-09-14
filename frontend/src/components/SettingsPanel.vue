@@ -1,11 +1,15 @@
 <!-- SPDX-License-Identifier: BSD-3-Clause -->
 <script setup lang="ts">
+import { MAX_GAIN_DB, MIN_GAIN_DB, formatGain } from '../audio/gain'
+
 defineProps<{
   targetMs: number
   /** Smallest sensible buffer: two frames, since audio arrives one frame at a time. */
   minTargetMs: number
   /** Buffers are measured in whole frames. */
   targetStepMs: number
+  /** Playback gain in decibels. */
+  gainDb: number
   resume: boolean
   theme: 'system' | 'light' | 'dark'
   repeatable: boolean
@@ -13,6 +17,7 @@ defineProps<{
 
 const emit = defineEmits<{
   'update:targetMs': [number]
+  'update:gainDb': [number]
   'update:resume': [boolean]
   'update:theme': ['system' | 'light' | 'dark']
   disconnectNow: []
@@ -72,6 +77,34 @@ const emit = defineEmits<{
           class="checkbox"
           @change="emit('update:resume', ($event.target as HTMLInputElement).checked)"
         />
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="label-block">
+        <label for="gain">Gain</label>
+        <p class="hint">
+          Applied to what is played, on the audio thread. The level meter reads after it, so the bar
+          and the number always describe what you are actually hearing.
+        </p>
+        <p class="hint detail">
+          The bottom of the range is silence rather than −60 dB. Positive gain amplifies whatever
+          noise the capture already carries, so watch the clip indicator on the meter; double-click
+          the slider to return to 0 dB.
+        </p>
+      </div>
+      <div class="control">
+        <input
+          id="gain"
+          type="range"
+          :min="MIN_GAIN_DB"
+          :max="MAX_GAIN_DB"
+          step="0.5"
+          :value="gainDb"
+          @input="emit('update:gainDb', Number(($event.target as HTMLInputElement).value))"
+          @dblclick="emit('update:gainDb', 0)"
+        />
+        <span class="value mono">{{ formatGain(gainDb) }}</span>
       </div>
     </div>
 

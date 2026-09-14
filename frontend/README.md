@@ -82,6 +82,14 @@ main thread are far too jittery to pace audio: they fire late under load, and
 background tabs are throttled. The worklet is called by the audio clock and
 drains a queue.
 
+**Gain is applied on the audio thread**, not through a `GainNode`, so the level
+meter reads what is actually heard. A node after the worklet would leave the
+meter showing pre-gain levels, which is worse than useless when the whole point
+of the control is that a stream is too quiet or too loud. The bottom of the
+range is silence rather than −60 dB, positive gain clamps at full scale rather
+than wrapping, and the meter grows a `clip` badge while that is happening — per
+report window, so it clears again instead of latching on the first loud moment.
+
 **The buffer is a real jitter buffer.** Playback waits until the target has
 accumulated, then plays continuously; the buffer is topped up as packets arrive
 at playback speed. Starting on the very first packet instead — the obvious
@@ -108,6 +116,8 @@ client can only know by checking:
 | latency trim | audio discarded because the buffer grew too far |
 | replayed | packets served from the server's history after a resume |
 | gaps flagged | the server itself reported a discontinuity |
+| gain | the playback gain in force, when it is not unity |
+| clipping | samples clamped at full scale in the last report |
 
 **The token is not saved.** It is held in memory for the session and retyped
 after a reload. `localStorage` is readable by any script on the origin, so one

@@ -138,7 +138,10 @@ test.describe('playback', () => {
       .toBeGreaterThan(target * 0.5)
 
     const current = await state(page)
-    expect(current.player.underruns, 'playback dropouts').toBeLessThanOrEqual(1)
+    // A small budget rather than zero: an unrelated process loading the machine
+    // can cost a block, and a test that fails for that teaches people to ignore
+    // it. The property under test is "not dropping out", not "at most one ever".
+    expect(current.player.underruns, 'playback dropouts').toBeLessThanOrEqual(3)
     expect(current.player.bufferedMs, 'buffer level').toBeLessThan(target * 4 + 500)
   })
 

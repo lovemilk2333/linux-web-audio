@@ -9,6 +9,7 @@ import StatsPanel from './components/StatsPanel.vue'
 
 import { Flag } from './audio/protocol'
 import { chooseCodec, createDecoder, opusPath, type Decoder, type StreamFormat } from './audio/decoder'
+import { clampGainDb, dbToLinear } from './audio/gain'
 import { Player, type PlayerStatus } from './audio/player'
 import { StreamStats } from './stats'
 import { fetchInfo, StreamReader, type ServerInfo, type StreamState } from './stream'
@@ -27,6 +28,8 @@ interface Settings {
    * number here would freeze whatever the last server's floor happened to be.
    */
   targetMs: number | null
+  /** Playback gain in decibels; not a secret, so it is remembered. */
+  gainDb: number
   resume: boolean
   theme: 'system' | 'light' | 'dark'
 }
@@ -41,6 +44,7 @@ function loadSettings(): Settings {
     // Lowest latency by default. The floor is where the audio thread stops
     // dropping blocks, so this is as current as the stream can be.
     targetMs: null,
+    gainDb: 0,
     resume: true,
     theme: 'system',
   }
@@ -101,6 +105,13 @@ const skipped = ref(0)
 let inReplay = false
 let replayBudgetFrames = 0
 
+const gainDb = computed({
+  get: () => clampGainDb(settings.gainDb),
+  set: (db: number) => {
+    settings.gainDb = clampGainDb(db)
+  },
+})
+
 const playerStatus = reactive<PlayerStatus>({
   bufferedMs: 0,
   underruns: 0,
@@ -110,6 +121,8 @@ const playerStatus = reactive<PlayerStatus>({
   playing: false,
   playedMs: 0,
   targetMs: 0,
+  gain: 1,
+  clipped: 0,
 })
 
 /* Bound once for the template. Deliberately not named `location`: that would
@@ -121,6 +134,11 @@ const pageLocation = {
 }
 
 const player = new Player()
+
+/* Pushed to the audio thread whenever it changes. The graph is rebuilt on some
+ * reconnects, and a fresh worklet starts at unity, so connect() sets it again
+ * after starting one. */
+watch(() => dbToLinear(gainDb.value), (linear) => player.setGain(linear), { immediate: true })
 const stats = shallowRef(new StreamStats(960))
 let reader: StreamReader | null = null
 let decoder: Decoder | null = null
@@ -202,6 +220,7 @@ watch(
             baseUrl: settings.baseUrl,
             codec: settings.codec,
             targetMs: settings.targetMs,
+            gainDb: settings.gainDb,
             resume: settings.resume,
             theme: settings.theme,
           }),
@@ -262,6 +281,9 @@ onMounted(async () => {
       },
       get targetMs() {
         return effectiveTargetMs.value
+      },
+      get gainDb() {
+        return gainDb.value
       },
     },
   })
@@ -357,6 +379,9 @@ async function connect({ reconnecting = false } = {}): Promise<void> {
     // reintroduce the startup gap for no reason.
     if (!player.running) {
       const rate = await player.start(format, effectiveTargetMs.value)
+      // The graph is new, so the gain the watcher pushed earlier went with the
+      // old one.
+      player.setGain(dbToLinear(gainDb.value))
       if (rate !== format.sampleRate) {
         log(
           'error',
@@ -523,7 +548,9 @@ function dropConnection(): void {
         />
         <SettingsPanel
           :target-ms="effectiveTargetMs"
+          :gain-db="gainDb"
           @update:target-ms="settings.targetMs = $event"
+          @update:gain-db="gainDb = $event"
           :min-target-ms="minTargetMs"
           :target-step-ms="targetStepMs"
           v-model:resume="settings.resume"
@@ -538,6 +565,7 @@ function dropConnection(): void {
           :stats="stats"
           :player="playerStatus"
           :connected="connected"
+          :gain-db="gainDb"
           :skipped="skipped"
           :tick="tick"
         />

@@ -152,7 +152,7 @@ const warning = computed(() => {
     </div>
 
     <div class="meter-row">
-      <LevelMeter :peak="player.peak" :active="connected" />
+      <LevelMeter :peak="player.peak" :clipped="player.clipped" :active="connected" />
     </div>
   </div>
 </template>

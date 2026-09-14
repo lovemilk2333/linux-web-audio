@@ -3,10 +3,16 @@
 import { computed } from 'vue'
 
 const props = defineProps<{
-  /** Loudest sample in the last report, 0..1. */
+  /** Loudest sample in the last report, 0..1, after gain. */
   peak: number
+  /** Samples clamped at full scale in the last report window. */
+  clipped: number
   active: boolean
 }>()
+
+/* Only a problem when the gain is turned up: at unity the capture itself can
+ * reach full scale without anything being wrong. */
+const clipping = computed(() => props.active && props.clipped > 0)
 
 /**
  * A level meter belongs on a decibel scale, not a linear one: a linear bar
@@ -39,6 +45,9 @@ const tone = computed(() => (percent.value > 92 ? 'hot' : percent.value > 70 ? '
       <!-- Marks where the meter would start clipping. -->
       <div class="mark" style="left: 92%" />
     </div>
+    <span v-if="clipping" class="clip" :title="`${clipped} samples clamped at full scale in the last report`">
+      clip
+    </span>
     <span class="label">{{ label }}</span>
   </div>
 </template>
@@ -81,6 +90,16 @@ const tone = computed(() => (percent.value > 92 ? 'hot' : percent.value > 70 ? '
   width: 1px;
   height: 100%;
   background: var(--mark);
+}
+
+.clip {
+  padding: 0.05rem 0.35rem;
+  border-radius: 4px;
+  background: var(--hot);
+  color: var(--panel);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
 }
 
 .label {

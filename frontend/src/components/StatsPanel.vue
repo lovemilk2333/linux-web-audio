@@ -2,6 +2,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 
+import { formatGain } from '../audio/gain'
 import type { StreamStats } from '../stats'
 import type { PlayerStatus } from '../audio/player'
 
@@ -11,6 +12,8 @@ const props = defineProps<{
   connected: boolean
   /** Replayed packets dropped undecoded because the buffer was already full. */
   skipped: number
+  /** Playback gain in decibels. */
+  gainDb: number
   /** Refreshes the display; the panels are read-only snapshots. */
   tick: number
 }>()
@@ -91,6 +94,24 @@ const health = computed(() => {
       label: 'latency trim',
       value: `${seconds.toFixed(2)} s discarded`,
       tone: 'warn',
+    })
+  }
+
+  if (props.gainDb !== 0) {
+    items.push({
+      label: 'gain',
+      value: formatGain(props.gainDb),
+      tone: props.gainDb > 0 ? 'warn' : 'ok',
+    })
+  }
+
+  if (props.player.clipped > 0) {
+    // Per report window, so this reads as "clipping right now" rather than as
+    // a total that never goes away.
+    items.push({
+      label: 'clipping',
+      value: `${props.player.clipped} samples in the last 100 ms`,
+      tone: 'bad',
     })
   }
 
