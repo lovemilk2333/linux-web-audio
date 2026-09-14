@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package server exposes the audio stream over HTTP.
 //
@@ -40,14 +40,19 @@ type Config struct {
 	Codecs []string
 	// CaptureLibrary is the capture library's version, reported by /audio/info.
 	CaptureLibrary string
-	Log            *slog.Logger
-	StartedAt      time.Time
+	// CORSOrigins lists the origins allowed to call the API from a browser.
+	// Empty disables CORS, which is the default: a separately served page is a
+	// cross-origin client and cannot work without this.
+	CORSOrigins []string
+	Log         *slog.Logger
+	StartedAt   time.Time
 }
 
 // Server implements http.Handler.
 type Server struct {
-	cfg Config
-	mux *http.ServeMux
+	cfg  Config
+	mux  *http.ServeMux
+	cors corsPolicy
 }
 
 // New builds the HTTP handler. The returned handler applies authentication when
@@ -57,13 +62,15 @@ func New(cfg Config) http.Handler {
 		cfg.Log = slog.Default()
 	}
 
-	s := &Server{cfg: cfg, mux: http.NewServeMux()}
+	s := &Server{cfg: cfg, mux: http.NewServeMux(), cors: newCORSPolicy(cfg.CORSOrigins)}
 	s.mux.HandleFunc("GET /audio/info", s.handleInfo)
 	s.mux.HandleFunc("GET /audio/stream", s.handleStream)
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 
-	// Health is deliberately outside the auth check so a probe needs no secret.
-	return s.authenticate(s.mux)
+	// CORS is outermost: a browser sends its preflight without the
+	// Authorization header, so it has to be answered before the auth check.
+	// Health stays outside the auth check so a probe needs no secret.
+	return s.withCORS(s.authenticate(s.mux))
 }
 
 func (s *Server) authenticate(next http.Handler) http.Handler {

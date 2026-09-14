@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package capweba binds the libwebaudio C ABI.
 //
@@ -6,13 +6,14 @@
 // types, so the rest of the program can be tested without building the capture
 // library — see the note in the README about the build order.
 //
-// The library is linked directly rather than dlopen'ed, which is why the Go
-// build needs capture/build/libwebaudio.so to exist first. Run `make lib`.
+// The library is resolved with pkg-config, so it has to be installed on the
+// system first — see the README. This repository carries no copy of it: it is a
+// GPL-3.0 component the user installs, which is what keeps this source under a
+// permissive licence.
 package capweba
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../capture/include
-#cgo LDFLAGS: -L${SRCDIR}/../../capture/build -lwebaudio -Wl,-rpath,${SRCDIR}/../../capture/build
+#cgo pkg-config: webacapture
 #include <stdlib.h>
 #include "webacapture.h"
 */

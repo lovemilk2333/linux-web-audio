@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Command webaudiod captures desktop audio and streams it over HTTP.
 //
@@ -42,6 +42,7 @@ type options struct {
 	clientQueue    int
 	slowClient     string
 	token          string
+	cors           string
 	vbr            bool
 	dtx            bool
 	fec            bool
@@ -75,6 +76,8 @@ func run() error {
 	flag.StringVar(&opts.slowClient, "slow-client", "fast-forward",
 		"what to do with a client that falls behind: fast-forward, drop or disconnect")
 	flag.StringVar(&opts.token, "token", "", "require this bearer token on every request (or set WEBA_TOKEN)")
+	flag.StringVar(&opts.cors, "cors", "",
+		"origins allowed to call this API from a browser, comma separated, or * for any. A separately served web page needs this")
 	flag.BoolVar(&opts.vbr, "vbr", false, "use variable bitrate where supported (Opus runs in constant bitrate by default, as Sunshine does)")
 	flag.BoolVar(&opts.dtx, "dtx", false, "enable discontinuous transmission where supported")
 	flag.BoolVar(&opts.fec, "fec", false, "enable in-band forward error correction where supported")
@@ -108,6 +111,11 @@ func run() error {
 	}
 
 	slowPolicy, err := hub.ParseSlowPolicy(opts.slowClient)
+	if err != nil {
+		return err
+	}
+
+	corsOrigins, err := server.ParseCORSOrigins(opts.cors)
 	if err != nil {
 		return err
 	}
@@ -161,6 +169,7 @@ func run() error {
 		Token:          token,
 		Codecs:         codecNames,
 		CaptureLibrary: capweba.Version(),
+		CORSOrigins:    corsOrigins,
 		Log:            logger,
 		StartedAt:      time.Now(),
 	})
@@ -183,7 +192,8 @@ func run() error {
 			"channels", opts.channels,
 			"frame_samples", frameSamples,
 			"frame_duration_ms", opts.frameDuration,
-			"auth", token != "")
+			"auth", token != "",
+			"cors", opts.cors)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- err
 			return

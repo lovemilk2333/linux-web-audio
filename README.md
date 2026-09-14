@@ -3,22 +3,41 @@
 Desktop audio, captured on Linux and streamed over HTTP as Opus.
 
 A Go server captures what the machine is playing, encodes it, and broadcasts it
-over a long-lived HTTP response to any number of clients. The capture itself
-lives in a separate GPL-3 licensed shared library, pulled in as a submodule.
+over a long-lived HTTP response to any number of clients.
 
 ```
 default sink's monitor
-  └─(pa_simple_read)  libwebaudio.so ── capture/  (C++, GPL-3.0)
+  └─(pa_simple_read)  libwebaudio.so ── installed separately, GPL-3.0
        └─(cgo)  one 20 ms frame at a time
             └─ hub: assign seq + sample timestamp, encode once per codec,
                     record history, fan out to every client
                  └─ HTTP chunked: 16-byte header + one encoded packet
 ```
 
-## Quick start
+`libwebaudio` is **not part of this repository**. It is a separate GPL-3.0
+project the user installs, which is what lets this source stay BSD-3-Clause.
+See [Licence](#licence) — the distinction matters if you redistribute binaries.
+
+## Install the capture library
 
 ```sh
-git clone --recurse-submodules https://github.com/lovemilk2333/linux-web-audio
+git clone https://github.com/lovemilk2333/linux-web-audio-capture
+cd linux-web-audio-capture
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+cmake --install build --prefix ~/.local
+
+export PKG_CONFIG_PATH=~/.local/lib/pkgconfig
+export LD_LIBRARY_PATH=~/.local/lib
+```
+
+Installing to `/usr/local` works too, but on Arch pkg-config does not search
+`/usr/local/lib/pkgconfig`, so you would still need `PKG_CONFIG_PATH`.
+
+## Build and run
+
+```sh
+git clone https://github.com/lovemilk2333/linux-web-audio
 cd linux-web-audio
 make build
 ./bin/webaudiod
@@ -28,10 +47,11 @@ curl -s localhost:8642/audio/info
 ./bin/webclient -duration 5s
 ```
 
-Requirements: a C++17 compiler, CMake, Go 1.24+, `libpulse-simple` and `libopus`
-with their development headers, and a running PipeWire or PulseAudio session.
+Requirements: Go 1.24+, `libopus` with development headers, and the capture
+library above. On Arch: `pacman -S go opus`.
 
-On Arch: `pacman -S base-devel cmake go libpulse opus`.
+`make check-lib` prints the install instructions above if pkg-config cannot find
+the library.
 
 ## Listening to it
 
@@ -90,7 +110,8 @@ is for.
 --complexity 5              --frame-duration 20       --sample-rate 48000
 --channels 2                --sink ""                 --history-packets 750
 --client-queue 64           --slow-client fast-forward
---token ""                  --vbr --dtx --fec         --log-level info
+--token ""                  --cors ""                 --vbr --dtx --fec
+--log-level info
 ```
 
 `--listen` defaults to loopback because this streams what the desktop is
@@ -107,6 +128,23 @@ while it has a subscriber, so an idle codec costs nothing:
 ./bin/webaudiod --codec opus,pcm_s16le
 ./bin/webclient -codec pcm_s16le -duration 3s    # the known-length codec
 ```
+
+### Serving a browser
+
+A web page served from anywhere other than this server is a cross-origin
+client, so it needs `--cors`:
+
+```sh
+./bin/webaudiod --cors 'http://localhost:5173'      # or a comma-separated list, or *
+```
+
+Origins are validated, because a stray trailing slash or a missing scheme
+produces no visible error — the browser simply refuses the request and the page
+reports a network failure.
+
+CORS also makes the server expose its `X-Audio-*` response headers. Without that
+a browser hides them, and a page cannot read the sequence range off a 416 to
+recover from an expired resume point.
 
 ## Behaviour worth knowing
 
@@ -127,20 +165,6 @@ the backlog and delivers the newest packet, flagging it `discontinuity` so the
 client knows. Measured impact on a fast client while another is throttled to
 1 KiB/s: none.
 
-**The macOS/Windows part of Sunshine is not here.** This is Linux only.
-
-## Relationship to Sunshine
-
-The capture library is a port of [Sunshine's](https://github.com/LizardByte/Sunshine)
-Linux audio backend, and both repositories are GPL-3.0 because of it. Sunshine
-has no HTTP interface and no equivalent of the resume protocol; that part is
-this project's.
-
-Sunshine captures audio through **libpulse**, not native PipeWire — its PipeWire
-code is video-only. So does this, which on a PipeWire system means going through
-`pipewire-pulse`. See `capture/NOTICE` for the exact derivation and
-`capture/README.md` for the list of deliberate departures from Sunshine.
-
 ## Repository layout
 
 ```
@@ -149,40 +173,36 @@ cmd/webclient       reference client, and the tool used to verify the protocol
 internal/proto      the wire format, and the wrap-safe sequence arithmetic
 internal/codec      Opus and raw PCM encoders, selected by name
 internal/hub        broadcast core: sequencing, history, fan-out, slow clients
-internal/server     the HTTP surface
+internal/server     the HTTP surface, including CORS
 internal/source     drives the capture library and publishes frames
 internal/capweba    the only package that touches C
-capture/            submodule: the GPL-3 capture library
 docs/protocol.md    the wire format, for anyone writing a client
-```
-
-## Building and testing
-
-The Go binaries link the capture library, so **the library must be built first**.
-`make` handles the ordering; a bare `go build` will not work until `make lib`
-has run once.
-
-```sh
-make lib      # build capture/build/libwebaudio.so from the submodule
-make build    # build both binaries into bin/
-make test     # the library's self test, then the Go tests
-make run      # build and start the server
-```
-
-`make test` runs the library's self test against the live audio session, so it
-needs a working audio server. The Go packages `proto`, `codec` and `hub` are
-tested without the capture library at all — `go test ./internal/proto/... ./internal/codec/... ./internal/hub/...`
-works with nothing built.
-
-The library's own tests:
-
-```sh
-capture/build/webaudio_selftest              # asserts format, cadence, lifecycle
-capture/build/webacap-dump out.wav 5         # capture to a WAV, with live stats
 ```
 
 ## Licence
 
-GPL-3.0. The capture library is a derivative work of Sunshine and is
-GPL-3.0-or-later; because it is linked into the server, the whole thing is
-GPL-3.0. See [LICENSE](LICENSE) and `capture/NOTICE`.
+**BSD-3-Clause**, for this repository.
+
+The capture library it links against, `libwebaudio`, is a derivative work of
+[Sunshine](https://github.com/LizardByte/Sunshine) and is **GPL-3.0-or-later**.
+It lives in its own repository and is installed separately by the user; no GPL
+code is present here.
+
+That separation is what keeps this source permissive, but it has a limit worth
+being precise about: **a binary built here and linked against libwebaudio is a
+combined work, and the GPL covers that combined work.** Dynamic linking is not a
+boundary under the GPL — that mechanism belongs to the LGPL, and the FSF's
+reading is that the whole program is covered however the linking is done.
+
+In practice:
+
+- Building and running it for yourself: no obligation. The GPL explicitly
+  permits private use.
+- Redistributing a binary linked against libwebaudio: that binary is GPL-3.0,
+  and must come with the corresponding source under GPL-3.0 terms.
+- Redistributing this source on its own: BSD-3-Clause, as the LICENSE says.
+
+Sunshine captures audio through **libpulse**, not native PipeWire — its PipeWire
+code is video-only. So does the capture library, which on a PipeWire system
+means going through `pipewire-pulse`. See the capture repository's `NOTICE` for
+the exact derivation.
