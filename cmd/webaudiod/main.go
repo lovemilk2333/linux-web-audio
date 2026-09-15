@@ -2,14 +2,16 @@
 
 // Command webaudiod captures desktop audio and streams it over HTTP.
 //
-// The stream is a long-lived chunked response: a sequence of 16-byte headers
-// each followed by one encoded packet. GET /audio/info describes the stream and
-// is the endpoint a client should consult first; GET /audio/stream?from_seq=N
-// resumes from a sequence number the client has already seen.
+// The stream is a sequence of 16-byte headers each followed by one encoded
+// packet, sent as WebSocket binary messages or as a long-lived chunked HTTP
+// response. GET /audio/info describes the stream and is the endpoint a client
+// should consult first; GET /audio/stream?from_seq=N resumes from a sequence
+// number the client has already seen.
 package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -252,6 +254,10 @@ func run() error {
 		// write deadline, so only the header read is bounded.
 		ReadHeaderTimeout: 10 * time.Second,
 		BaseContext:       func(net.Listener) context.Context { return ctx },
+		// A 5 ms Opus packet is ~100 bytes. Nagle would hold that write
+		// for an ACK, which is the whole frame period back again. Applies
+		// to HTTP and to a WebSocket upgrade on the same socket.
+		ConnState: disableNagle,
 	}
 
 	serve := func() error {
@@ -304,6 +310,21 @@ func run() error {
 		logger.Warn("graceful shutdown did not complete", "error", err)
 	}
 	return nil
+}
+
+// disableNagle turns TCP_NODELAY on as soon as a connection is accepted.
+//
+// The Conn may be a *tls.Conn wrapping the TCP socket, so unwrap that first.
+func disableNagle(conn net.Conn, state http.ConnState) {
+	if state != http.StateNew {
+		return
+	}
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		conn = tlsConn.NetConn()
+	}
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+	}
 }
 
 // hostOf returns the host part of a listen address, or the address itself if

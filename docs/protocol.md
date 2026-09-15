@@ -1,8 +1,9 @@
 # The wire protocol
 
 A client fetches `/audio/info`, opens `/audio/stream`, and reads a sequence of
-framed packets off a chunked HTTP response. To reconnect without a gap it passes
-`?from_seq=N`.
+framed packets. A browser should open a WebSocket and take one binary message
+per packet; anything that cannot upgrade still reads the same bytes off a
+chunked HTTP response. To reconnect without a gap it passes `?from_seq=N`.
 
 Everything is big-endian. Both `seq` and `timestamp` wrap around, so they must be
 compared as distances on a circle rather than as integers.
@@ -112,10 +113,18 @@ devices, and `capture_reopens` counts how often that has happened.
 | --- | --- |
 | `codec` | one of `codecs`; defaults to the server's `--codec` |
 | `from_seq` (or `seq`) | resume at this sequence number; omitted means join at the live edge |
+| `token` | bearer token, **WebSocket only**. Browsers cannot set `Authorization` on `WebSocket()`, so the handshake carries the secret here. It will appear in reverse-proxy access logs. HTTP clients should keep using `Authorization: Bearer`. `/audio/info` does not accept this. |
+
+A `Upgrade: websocket` handshake is accepted **after** the codec and resume
+point have been checked. One binary message is then sent per packet: the same
+16-byte header plus payload, no extra framing, no permessage-deflate. 400 / 416
+/ 401 stay ordinary HTTP JSON — the browser `WebSocket` constructor cannot read
+those headers, so a page that sees the handshake fail should retry with `fetch`
+for that attempt (which is how a 416 still reports the resume range).
 
 ### Responses
 
-**200** — the stream. Headers:
+**200** — the HTTP stream. Headers:
 
 ```
 Content-Type: application/octet-stream
@@ -150,7 +159,11 @@ A client should read those and either retry at a valid point or reconnect
 without `from_seq` to start live.
 
 **401** — the server was started with `--token` and the request lacked a matching
-`Authorization: Bearer <token>`. The response carries `WWW-Authenticate`.
+`Authorization: Bearer <token>` (or, on `/audio/stream` only, `?token=`). The
+response carries `WWW-Authenticate`.
+
+**101** — the WebSocket stream. The `X-Audio-*` headers above are set on the
+switching-protocols response as well, then each packet is one binary message.
 
 ### The stream never ends on its own
 

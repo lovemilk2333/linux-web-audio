@@ -84,6 +84,14 @@ export class StreamError extends Error {
   }
 }
 
+/** The WebSocket handshake never completed; the caller may try HTTP instead. */
+class HandshakeError extends StreamError {
+  constructor(message: string) {
+    super(message)
+    this.name = 'HandshakeError'
+  }
+}
+
 /**
  * The API's prefix, matching the server's --base-path.
  *
@@ -107,6 +115,44 @@ export function apiRoot(serverUrl: string): string {
 
 function authHeaders(token: string): HeadersInit {
   return token ? { Authorization: `Bearer ${token}` } : {}
+}
+
+export interface StreamURLOptions {
+  baseUrl: string
+  codec: string
+  /** Resume from this sequence number, or omit to join live. */
+  fromSeq?: number | null
+  /**
+   * When set, put the token on `?token=` rather than in a header.
+   *
+   * Browsers cannot set Authorization on `WebSocket()`, so the handshake
+   * carries the secret in the query. It will appear in reverse-proxy access
+   * logs; that is the cost of authenticating a handshake the page cannot
+   * otherwise sign.
+   */
+  tokenQuery?: string
+}
+
+/**
+ * Builds the stream URL, for either fetch or WebSocket.
+ *
+ * Relative `baseUrl` values resolve against `document.baseURI`, which is how
+ * the page and a reverse proxy share an origin with nothing to configure.
+ */
+export function streamURL(options: StreamURLOptions, websocket: boolean): URL {
+  const base = typeof document !== 'undefined' ? document.baseURI : 'http://localhost/'
+  const url = new URL(`${apiRoot(options.baseUrl)}/audio/stream`, base)
+  url.searchParams.set('codec', options.codec)
+  if (options.fromSeq != null) {
+    url.searchParams.set('from_seq', String(options.fromSeq))
+  }
+  if (options.tokenQuery) {
+    url.searchParams.set('token', options.tokenQuery)
+  }
+  if (websocket) {
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+  }
+  return url
 }
 
 /** Reads a header, returning null rather than throwing when it is absent. */
@@ -234,17 +280,98 @@ export class StreamReader {
   /**
    * Reads one connection to its end.
    *
+   * Tries a WebSocket first: through a reverse proxy, a long-lived HTTP
+   * response is allowed to buffer, and a binary message per packet is not.
+   * A handshake that never completes falls back to fetch for this attempt —
+   * which is how 416 still reports the resume range, because the browser
+   * WebSocket constructor cannot read HTTP headers. Once the socket is
+   * open, a later failure reconnects rather than stacking a second
+   * subscriber. The next reconnect tries WebSocket again.
+   *
    * @returns why it ended, for the caller's log.
    */
   private async readOnce(signal: AbortSignal): Promise<string> {
-    const { baseUrl, codec, token, resume, onFrame, onEvent } = this.options
+    const fromSeq = this.options.resume && this.lastSeq !== null ? seqNext(this.lastSeq) : null
 
-    const url = new URL(`${apiRoot(baseUrl)}/audio/stream`, document.baseURI)
-    url.searchParams.set('codec', codec)
-    if (resume && this.lastSeq !== null) {
-      url.searchParams.set('from_seq', String(seqNext(this.lastSeq)))
+    if (typeof WebSocket !== 'undefined') {
+      try {
+        return await this.readWebSocket(signal, fromSeq)
+      } catch (error) {
+        if (!this.running || signal.aborted) throw error
+        if (!(error instanceof HandshakeError)) throw error
+        // Handshake never completed: 416, 401, an old server, a proxy that
+        // blocks Upgrade. fetch on this attempt can still read those statuses.
+      }
     }
 
+    return this.readFetch(signal, fromSeq)
+  }
+
+  private async readWebSocket(signal: AbortSignal, fromSeq: number | null): Promise<string> {
+    const { baseUrl, codec, token, onFrame, onEvent } = this.options
+    const url = streamURL({
+      baseUrl,
+      codec,
+      fromSeq,
+      tokenQuery: token || undefined,
+    }, true)
+
+    let socket: WebSocket
+    try {
+      socket = new WebSocket(url)
+    } catch (error) {
+      throw new HandshakeError(error instanceof Error ? error.message : String(error))
+    }
+    socket.binaryType = 'arraybuffer'
+
+    try {
+      await waitForOpen(socket, signal)
+    } catch (error) {
+      socket.close()
+      throw error
+    }
+
+    const resumed = fromSeq !== null
+    onEvent({
+      kind: 'open',
+      message: resumed && this.lastSeq !== null
+        ? `resumed at seq ${seqNext(this.lastSeq)}`
+        : 'connected at the live edge',
+    })
+    this.options.onState('streaming')
+
+    const parser = new FrameParser()
+    const stallTimeout = this.options.stallTimeoutMs ?? 3000
+
+    try {
+      for (;;) {
+        const data = await nextMessage(socket, stallTimeout, signal)
+        if (data === null) return 'the server closed the stream'
+
+        let frames
+        try {
+          frames = parser.push(data)
+        } catch (error) {
+          if (error instanceof ProtocolError) {
+            throw new StreamError(`framing error: ${error.message}`)
+          }
+          throw error
+        }
+
+        for (const frame of frames) {
+          this.lastSeq = frame.seq
+          onFrame(frame)
+        }
+      }
+    } finally {
+      socket.close()
+    }
+  }
+
+  private async readFetch(signal: AbortSignal, fromSeq: number | null): Promise<string> {
+    const { baseUrl, codec, token, onFrame, onEvent } = this.options
+
+    const url = streamURL({ baseUrl, codec, fromSeq }, false)
     const response = await fetch(url, { headers: authHeaders(token), signal })
 
     if (response.status === 416) {
@@ -294,7 +421,7 @@ export class StreamReader {
       throw new StreamError('the response has no body to stream')
     }
 
-    const resumed = url.searchParams.has('from_seq')
+    const resumed = fromSeq !== null
     onEvent({
       kind: 'open',
       message: resumed && this.lastSeq !== null
@@ -346,6 +473,121 @@ export class StreamReader {
  * pending until TCP times out. The stream is never quiet for long, so silence
  * is a reliable signal.
  */
+/**
+ * Resolves when the socket opens, or rejects if it closes first.
+ *
+ * A 416 / 401 on the handshake lands here as a close: the constructor cannot
+ * read those headers, so the caller falls back to fetch.
+ */
+function waitForOpen(socket: WebSocket, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (socket.readyState === WebSocket.OPEN) {
+      resolve()
+      return
+    }
+    if (socket.readyState === WebSocket.CLOSING || socket.readyState === WebSocket.CLOSED) {
+      reject(new HandshakeError('the websocket closed before it opened'))
+      return
+    }
+
+    const onAbort = () => {
+      cleanup()
+      reject(new DOMException('The operation was aborted.', 'AbortError'))
+    }
+    const onOpen = () => {
+      cleanup()
+      resolve()
+    }
+    const onError = () => {
+      cleanup()
+      reject(new HandshakeError('the websocket handshake failed'))
+    }
+    const onClose = () => {
+      cleanup()
+      reject(new HandshakeError('the websocket closed before it opened'))
+    }
+    const cleanup = () => {
+      socket.removeEventListener('open', onOpen)
+      socket.removeEventListener('error', onError)
+      socket.removeEventListener('close', onClose)
+      signal.removeEventListener('abort', onAbort)
+    }
+
+    socket.addEventListener('open', onOpen)
+    socket.addEventListener('error', onError)
+    socket.addEventListener('close', onClose)
+    signal.addEventListener('abort', onAbort, { once: true })
+    if (signal.aborted) onAbort()
+  })
+}
+
+/**
+ * Waits for one binary message, or null if the socket closed cleanly.
+ *
+ * A stall is treated as a dead connection, the same as on the HTTP path: the
+ * server sends a packet every frame period, including silence.
+ */
+function nextMessage(
+  socket: WebSocket,
+  timeoutMs: number,
+  signal: AbortSignal,
+): Promise<Uint8Array | null> {
+  return new Promise((resolve, reject) => {
+    if (socket.readyState === WebSocket.CLOSING || socket.readyState === WebSocket.CLOSED) {
+      resolve(null)
+      return
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined
+
+    const onAbort = () => {
+      cleanup()
+      reject(new DOMException('The operation was aborted.', 'AbortError'))
+    }
+    const onMessage = (event: MessageEvent) => {
+      cleanup()
+      if (event.data instanceof ArrayBuffer) {
+        resolve(new Uint8Array(event.data))
+        return
+      }
+      if (event.data instanceof Blob) {
+        void event.data.arrayBuffer().then(
+          (buffer) => resolve(new Uint8Array(buffer)),
+          reject,
+        )
+        return
+      }
+      reject(new StreamError('the websocket sent a non-binary message'))
+    }
+    const onError = () => {
+      cleanup()
+      reject(new StreamError('the websocket failed'))
+    }
+    const onClose = () => {
+      cleanup()
+      resolve(null)
+    }
+    const cleanup = () => {
+      clearTimeout(timer)
+      socket.removeEventListener('message', onMessage)
+      socket.removeEventListener('error', onError)
+      socket.removeEventListener('close', onClose)
+      signal.removeEventListener('abort', onAbort)
+    }
+
+    timer = setTimeout(() => {
+      cleanup()
+      reject(new StreamError(`nothing arrived for ${timeoutMs} ms, treating the stream as dead`))
+    }, timeoutMs)
+
+    socket.addEventListener('message', onMessage)
+    socket.addEventListener('error', onError)
+    socket.addEventListener('close', onClose)
+    signal.addEventListener('abort', onAbort, { once: true })
+    if (signal.aborted) onAbort()
+  })
+}
+
 function readOrStall(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   timeoutMs: number,

@@ -3,7 +3,8 @@
 Desktop audio, captured on Linux and streamed over HTTP as Opus.
 
 A Go server captures what the machine is playing, encodes it, and broadcasts it
-over a long-lived HTTP response to any number of clients.
+to any number of clients. A browser opens a WebSocket; everything else can still
+read a long-lived HTTP response of the same packets.
 
 ```
 default sink's monitor
@@ -11,7 +12,7 @@ default sink's monitor
        └─(cgo)  one 5 ms frame at a time
             └─ hub: assign seq + sample timestamp, encode once per codec,
                     record history, fan out to every client
-                 └─ HTTP chunked: 16-byte header + one encoded packet
+                 └─ WebSocket binary, or HTTP chunked: 16-byte header + one packet
 ```
 
 `libwebaudio` is **not part of this repository**. It is a separate GPL-3.0
@@ -207,6 +208,10 @@ The rest:
   interface is authentication without secrecy. Use `--tls-cert`/`--tls-key`, or
   terminate TLS in front of the server; it warns when it is serving plain HTTP
   beyond loopback.
+- **A browser WebSocket cannot set `Authorization`.** The page therefore puts
+  the token on `?token=` of `/audio/stream` only. That query will appear in
+  reverse-proxy access logs. HTTP clients, including `/audio/info`, keep using
+  the bearer header.
 
 None of this protects against a malicious process already running as your user:
 it can open `/run/user/$UID/pipewire-0` and capture the same audio directly.

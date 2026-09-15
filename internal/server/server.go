@@ -5,13 +5,16 @@
 // Two endpoints matter to a client:
 //
 //	GET /audio/info    capability discovery, in JSON
-//	GET /audio/stream  the stream itself, a chunked response of framed packets
+//	GET /audio/stream  the stream itself: WebSocket binary messages, or a
+//	                   chunked HTTP response of the same framed packets
 //
 // A client should read /audio/info first, then connect to /audio/stream,
-// optionally passing ?from_seq to resume where it left off.
+// optionally passing ?from_seq to resume where it left off. A browser should
+// open a WebSocket; anything that cannot upgrade still reads the chunked body.
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/lovemilk2333/linux-web-audio/internal/codec"
 	"github.com/lovemilk2333/linux-web-audio/internal/hub"
 	"github.com/lovemilk2333/linux-web-audio/internal/proto"
@@ -136,6 +140,14 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 		}
 
 		provided, ok := bearerToken(r)
+		// Browsers cannot set Authorization on WebSocket(), so the stream
+		// also accepts ?token=. It will appear in reverse-proxy access logs;
+		// that is the cost of a handshake the page cannot otherwise authenticate.
+		if !ok && r.URL.Path == s.Path("/audio/stream") {
+			if q := r.URL.Query().Get("token"); q != "" {
+				provided, ok = q, true
+			}
+		}
 		if !ok || provided != s.cfg.Token {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="linux-web-audio"`)
 			writeJSONError(w, http.StatusUnauthorized, "a bearer token is required")
@@ -265,6 +277,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	header.Set("X-Audio-Header-Size", strconv.Itoa(proto.HeaderSize))
 	header.Set("X-Audio-Seq-Start", strconv.Itoa(int(startSeq)))
 
+	if wantsWebSocket(r) {
+		s.serveWebSocket(w, r, sub)
+		return
+	}
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeJSONError(w, http.StatusInternalServerError, "the connection does not support streaming")
@@ -276,13 +293,56 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	// The response stays open until the client goes away or the stream ends.
 	// Nothing below writes a status code, so the 200 stands.
+	s.writePackets(r.Context(), sub, func(buf []byte) error {
+		if _, err := w.Write(buf); err != nil {
+			return err
+		}
+		// Flushed per packet: at one packet per frame period this is the
+		// difference between live audio and audio that arrives in bursts.
+		flusher.Flush()
+		return nil
+	})
+}
+
+// wantsWebSocket reports a handshake. Checked after Subscribe so 400 / 416
+// stay ordinary HTTP JSON: the browser WebSocket constructor cannot read
+// those headers, and the page falls back to fetch for that attempt.
+func wantsWebSocket(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+}
+
+func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, sub *hub.Subscriber) {
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		// Host-guard already refused a rebound Host. CORS does not apply to
+		// WebSocket, and behind a reverse proxy the Origin is the page while
+		// the backend Host is 127.0.0.1 — matching them would reject the
+		// same-origin proxy case this is built for.
+		InsecureSkipVerify: true,
+		CompressionMode:    websocket.CompressionDisabled,
+	})
+	if err != nil {
+		s.cfg.Log.Debug("websocket accept failed", "error", err)
+		return
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	// CloseRead notices the client going away (and answers pings) so the
+	// write loop's context ends instead of blocking on the next packet.
+	ctx := conn.CloseRead(r.Context())
+	s.writePackets(ctx, sub, func(buf []byte) error {
+		return conn.Write(ctx, websocket.MessageBinary, buf)
+	})
+}
+
+// writePackets frames each hub packet and hands it to send, until the
+// subscriber ends or send fails.
+func (s *Server) writePackets(ctx context.Context, sub *hub.Subscriber, send func([]byte) error) {
 	buf := make([]byte, 0, proto.HeaderSize+2048)
 	sent := 0
-
 	for {
-		pkt, err := sub.Next(r.Context())
+		pkt, err := sub.Next(ctx)
 		if err != nil {
-			if !errors.Is(err, io.EOF) && !errors.Is(err, r.Context().Err()) {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, ctx.Err()) {
 				s.cfg.Log.Debug("stream ended", "error", err, "packets", sent)
 			}
 			return
@@ -294,12 +354,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			Timestamp: pkt.Timestamp,
 		}, pkt.Payload)
 
-		if _, err := w.Write(buf); err != nil {
+		if err := send(buf); err != nil {
 			return
 		}
-		// Flushed per packet: at one packet per frame period this is the
-		// difference between live audio and audio that arrives in bursts.
-		flusher.Flush()
 		sent++
 	}
 }

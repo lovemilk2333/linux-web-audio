@@ -1,7 +1,8 @@
 # linux-web-audio frontend
 
-A browser player and monitor for the stream. It connects to an HTTP long
-connection, decodes what arrives, and plays it through an AudioWorklet.
+A browser player and monitor for the stream. It opens a WebSocket (falling
+back to a chunked HTTP response), decodes what arrives, and plays it through
+an AudioWorklet.
 
 No server code lives here: this is a static page. The dev and preview servers
 forward `/backend` to the API, so the page and the stream share an origin and
@@ -45,8 +46,8 @@ The API lives under a base path, `/backend` by default, matching the server's
 ## How it works
 
 ```
-GET /audio/stream  (chunked, never ends)
-  └─ ReadableStream ── FrameParser ── one 16-byte header + payload per frame
+GET /audio/stream  (WebSocket binary messages, or chunked HTTP)
+  └─ one 16-byte header + payload per frame ── FrameParser
        └─ decoder ──┐
                     ├─ opus      → WebCodecs AudioDecoder
                     ├─ opus      → opus-decoder (WASM, fetched on demand)

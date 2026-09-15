@@ -12,8 +12,21 @@ example.com {
 	}
 
 	# backend reverse proxy
-	handle_path /backend* {
-		reverse_proxy 127.0.0.1:8642
+	#
+	# handle, not handle_path: webaudiod's default --base-path is /backend, so
+	# the prefix has to stay on the request. handle_path would strip it and
+	# every endpoint would 404.
+	#
+	# --allowed-hosts must include this site's name (example.com here). The
+	# Host arriving at webaudiod is the public one, and the host-guard
+	# refuses anything it does not answer to.
+	handle /backend* {
+		reverse_proxy 127.0.0.1:8642 {
+			# A leftover HTTP client still uses the chunked body. Without this
+			# Caddy may gather packets; -1 flushes immediately. WebSocket
+			# upgrades need no extra directive.
+			flush_interval -1
+		}
 	}
 
 	# other root
