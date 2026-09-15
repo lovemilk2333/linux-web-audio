@@ -609,6 +609,70 @@ func TestStatsReportTheStreamShape(t *testing.T) {
 	}
 }
 
+func TestRecentReturnsNewestPackets(t *testing.T) {
+	h, src := startHub(t, testConfig())
+
+	sub, err := h.Subscribe("opus", nil)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub.Close()
+
+	src.send(10, 0)
+	for range 10 {
+		mustNext(t, sub)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	got := h.Recent("opus", 3)
+	if len(got) != 3 {
+		t.Fatalf("Recent returned %d packets, want 3", len(got))
+	}
+	if got[0].Seq+2 != got[2].Seq {
+		t.Errorf("Recent packets were not contiguous: %d, %d, %d", got[0].Seq, got[1].Seq, got[2].Seq)
+	}
+	if got[2].Seq != h.Stats().CurrentSeq {
+		t.Errorf("newest Recent seq = %d, want current %d", got[2].Seq, h.Stats().CurrentSeq)
+	}
+	for i, pkt := range got {
+		if pkt.Flags&proto.FlagCatchup == 0 {
+			t.Errorf("Recent packet %d is missing the catch-up flag", i)
+		}
+	}
+}
+
+func TestPrefillReplaysAfterAlreadySent(t *testing.T) {
+	h, src := startHub(t, testConfig())
+
+	sub, err := h.Subscribe("opus", nil)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	defer sub.Close()
+
+	src.send(5, 0)
+	var last Packet
+	for range 5 {
+		last = mustNext(t, sub)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	// Without clearing alreadySent, Prefill of overlapping history would
+	// be skipped and the play buffer would stay empty after a jump.
+	sub.Prefill(h.Recent("opus", 3))
+	if sub.Backlog() < 3 {
+		t.Fatalf("Backlog after Prefill = %d, want at least 3", sub.Backlog())
+	}
+
+	first := mustNext(t, sub)
+	if first.Flags&proto.FlagCatchup == 0 {
+		t.Error("prefilled packet is missing the catch-up flag")
+	}
+	if proto.SeqDiff(first.Seq, last.Seq) < 0 {
+		t.Errorf("prefilled seq %d is ahead of last live %d", first.Seq, last.Seq)
+	}
+}
+
 func TestParseSlowPolicy(t *testing.T) {
 	for name, want := range map[string]SlowPolicy{
 		"fast-forward": FastForward,

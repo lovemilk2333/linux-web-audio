@@ -188,6 +188,7 @@ type infoResponse struct {
 	CaptureReopens  int      `json:"capture_reopens"`
 	HeaderSize      int      `json:"header_size"`
 	TimestampUnit   string   `json:"timestamp_unit"`
+	EncodeUs        uint64   `json:"encode_us"`
 }
 
 func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
@@ -213,6 +214,7 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		// The timestamp counts samples rather than wall clock, so it stays
 		// exact and evenly spaced even while the desktop is silent.
 		TimestampUnit: "samples",
+		EncodeUs:      stats.EncodeUs,
 	}
 
 	if s.cfg.Source != nil {
@@ -277,8 +279,10 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	header.Set("X-Audio-Header-Size", strconv.Itoa(proto.HeaderSize))
 	header.Set("X-Audio-Seq-Start", strconv.Itoa(int(startSeq)))
 
+	buffer := parseBufferMs(r.URL.Query())
+
 	if wantsWebSocket(r) {
-		s.serveWebSocket(w, r, sub)
+		s.serveWebSocket(w, r, sub, buffer)
 		return
 	}
 
@@ -293,7 +297,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	// The response stays open until the client goes away or the stream ends.
 	// Nothing below writes a status code, so the 200 stands.
-	s.writePackets(r.Context(), sub, func(buf []byte) error {
+	s.writePackets(r.Context(), sub, buffer, func(buf []byte) error {
 		if _, err := w.Write(buf); err != nil {
 			return err
 		}
@@ -311,7 +315,7 @@ func wantsWebSocket(r *http.Request) bool {
 	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
 }
 
-func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, sub *hub.Subscriber) {
+func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, sub *hub.Subscriber, buffer time.Duration) {
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		// Host-guard already refused a rebound Host. CORS does not apply to
 		// WebSocket, and behind a reverse proxy the Origin is the page while
@@ -329,23 +333,67 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, sub *hub
 	// CloseRead notices the client going away (and answers pings) so the
 	// write loop's context ends instead of blocking on the next packet.
 	ctx := conn.CloseRead(r.Context())
-	s.writePackets(ctx, sub, func(buf []byte) error {
+	s.writePackets(ctx, sub, buffer, func(buf []byte) error {
 		return conn.Write(ctx, websocket.MessageBinary, buf)
 	})
 }
 
 // writePackets frames each hub packet and hands it to send, until the
 // subscriber ends or send fails.
-func (s *Server) writePackets(ctx context.Context, sub *hub.Subscriber, send func([]byte) error) {
+//
+// Live packets wait on capture, which is already 1×. A backlog — resume
+// catchup, a live-join prefill, or a queue that built up — is paced at 2×
+// the frame rate until it is 5 ms ahead, then 1.25× until it reaches the
+// client's play buffer, then 0.75× so the buffer cannot grow without bound.
+func (s *Server) writePackets(ctx context.Context, sub *hub.Subscriber, buffer time.Duration, send func([]byte) error) {
+	stats := s.cfg.Hub.Stats()
+	frame := time.Duration(stats.FrameDurationMS * float64(time.Millisecond))
+	pacer := hub.SendPacer{Frame: frame, Buffer: buffer}
+
+	// A live join has no catchup. Prefill one play-buffer of history so
+	// the first packets go out at 2× instead of waiting a whole target
+	// at 1×.
+	s.prefillRecent(sub, buffer, frame, false)
+
 	buf := make([]byte, 0, proto.HeaderSize+2048)
 	sent := 0
+	var nextAt time.Time
 	for {
+		if !nextAt.IsZero() {
+			if wait := time.Until(nextAt); wait > 0 {
+				timer := time.NewTimer(wait)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+			}
+		}
+
 		pkt, err := sub.Next(ctx)
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, ctx.Err()) {
 				s.cfg.Log.Debug("stream ended", "error", err, "packets", sent)
 			}
 			return
+		}
+
+		// FastForward (and a capture reopen) leave a hole. Live 1×
+		// cannot refill the play buffer. Queue a target of history
+		// *before* this packet so the client hears it in order, then
+		// send at 2×. Catchup already went through this path; prefill
+		// again would loop. The dequeued packet is in Recent, so it
+		// is not sent here. History does not store the FastForward
+		// flag, so the first refill packet is marked discontinuous.
+		if pkt.Flags&proto.FlagDiscontinuity != 0 &&
+			pkt.Flags&proto.FlagCatchup == 0 &&
+			sub.Backlog() == 0 &&
+			buffer > 0 && frame > 0 {
+			if s.prefillRecent(sub, buffer, frame, true) {
+				pacer.Reset()
+				continue
+			}
 		}
 
 		buf = proto.AppendPacket(buf[:0], proto.Header{
@@ -358,7 +406,59 @@ func (s *Server) writePackets(ctx context.Context, sub *hub.Subscriber, send fun
 			return
 		}
 		sent++
+
+		now := time.Now()
+		interval := pacer.ObserveSend(now)
+		if sub.Backlog() > 0 {
+			nextAt = now.Add(interval)
+		} else {
+			// Capture already spaces live packets. Sleeping here would
+			// only make the subscriber queue grow.
+			pacer.Reset()
+			nextAt = time.Time{}
+		}
 	}
+}
+
+// prefillRecent queues about one play-buffer of history when the subscriber
+// has nothing waiting. markGap sets FlagDiscontinuity on the first packet:
+// FastForward adds that flag at push time, and history does not store it.
+func (s *Server) prefillRecent(sub *hub.Subscriber, buffer, frame time.Duration, markGap bool) bool {
+	if sub.Backlog() > 0 || buffer <= 0 || frame <= 0 {
+		return false
+	}
+	n := int(buffer/frame) + 1
+	if n <= 0 {
+		return false
+	}
+	refill := s.cfg.Hub.Recent(sub.Codec(), n)
+	if len(refill) == 0 {
+		return false
+	}
+	if markGap {
+		refill[0].Flags |= proto.FlagDiscontinuity
+	}
+	sub.Prefill(refill)
+	return true
+}
+
+// parseBufferMs reads the client's play-buffer target from ?buffer_ms.
+// That is the 0.75× ceiling and the live-join prefill. Missing or unusable
+// values mean no prefill and no 0.75× cap, so CLI clients keep joining at
+// the live edge.
+func parseBufferMs(q url.Values) time.Duration {
+	raw := q.Get("buffer_ms")
+	if raw == "" {
+		return 0
+	}
+	ms, err := strconv.ParseFloat(raw, 64)
+	if err != nil || ms <= 0 {
+		return 0
+	}
+	if ms > 1500 {
+		ms = 1500
+	}
+	return time.Duration(ms * float64(time.Millisecond))
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

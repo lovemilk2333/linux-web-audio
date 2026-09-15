@@ -30,7 +30,8 @@ type Subscriber struct {
 	hub    *Hub
 
 	// catchup holds history packets to replay before the live stream. It is
-	// fixed at construction, so no lock is needed to read it.
+	// written at construction and by Prefill, always from the Next goroutine
+	// after Subscribe returns, so no lock is needed to read it.
 	catchup []Packet
 
 	closeOnce sync.Once
@@ -65,6 +66,27 @@ func (s *Subscriber) Closed() bool {
 	default:
 		return false
 	}
+}
+
+// Backlog is how many packets Next can return without waiting on capture.
+func (s *Subscriber) Backlog() int {
+	return max(0, len(s.catchup)-s.catchupIndex) + len(s.ch)
+}
+
+// Prefill queues history to send before live packets, when nothing is
+// already scheduled. Used to fill a client's play buffer at 2× on a live
+// join, and to rebuild it after FastForward jumped the queue.
+//
+// alreadySent is cleared: these packets were produced, but the client
+// never received them (or needs them again to refill), so skipping them
+// would leave the play buffer empty.
+func (s *Subscriber) Prefill(packets []Packet) {
+	if s.catchupIndex < len(s.catchup) || len(packets) == 0 {
+		return
+	}
+	s.catchup = packets
+	s.catchupIndex = 0
+	s.haveSent = false
 }
 
 // Next returns the next packet to send, replaying the catch-up backlog first.

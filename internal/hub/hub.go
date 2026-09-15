@@ -165,6 +165,10 @@ type Hub struct {
 	// Counters for /audio/info.
 	packetsSent atomic.Uint64
 	frames      atomic.Uint64
+	// encodeUs is an exponential moving average of how long Encode() took,
+	// in microseconds. The page shows this as encode latency; libopus
+	// already uses SIMD, and a 5 ms frame is too short for a GPU round trip.
+	encodeUs atomic.Uint64
 }
 
 // New creates a Hub.
@@ -267,8 +271,11 @@ func (h *Hub) process(frame Frame) {
 
 	entry := historyEntry{seq: seq, timestamp: timestamp, flags: frame.Flags}
 
+	var encodeNs time.Duration
 	for name, st := range h.encoders {
+		started := time.Now()
 		payload, err := st.enc.Encode(frame.PCM)
+		encodeNs += time.Since(started)
 		if err != nil {
 			h.log.Error("encoding failed", "codec", name, "error", err)
 			continue
@@ -278,6 +285,7 @@ func (h *Hub) process(frame Frame) {
 		data := bytes.Clone(payload)
 		entry.payloads = append(entry.payloads, payloadRef{codec: name, data: data})
 	}
+	h.observeEncode(encodeNs)
 
 	// Recorded even when no subscriber wanted it, so a client that reconnects
 	// can still be served the recent past.
@@ -403,6 +411,7 @@ type Stats struct {
 	Subscribers     int
 	Frames          uint64
 	Encoders        []string
+	EncodeUs        uint64
 }
 
 // Stats returns a snapshot of the hub's state.
@@ -433,6 +442,7 @@ func (h *Hub) Stats() Stats {
 		Subscribers:     subscribers,
 		Frames:          h.frames.Load(),
 		Encoders:        encoders,
+		EncodeUs:        h.encodeUs.Load(),
 	}
 	if haveHistory {
 		// The next sequence number is one past the newest packet stored, which
@@ -443,4 +453,51 @@ func (h *Hub) Stats() Stats {
 		stats.CurrentSeq = currentSeq - 1
 	}
 	return stats
+}
+
+// observeEncode folds one Encode() duration into the displayed average.
+func (h *Hub) observeEncode(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	us := uint64(d.Microseconds())
+	if us == 0 {
+		us = 1
+	}
+	prev := h.encodeUs.Load()
+	if prev == 0 {
+		h.encodeUs.Store(us)
+		return
+	}
+	h.encodeUs.Store((prev*7 + us) / 8)
+}
+
+// ReplayFrom returns history packets for codec covering (after, latest],
+// flagged catchup. Used to refill a subscriber that FastForward jumped.
+func (h *Hub) ReplayFrom(codecName string, after uint16) []Packet {
+	oldest, latest, ok := h.history.bounds()
+	if !ok {
+		return nil
+	}
+	from := after + 1
+	if !proto.SeqInWindow(from, oldest, latest) {
+		from = oldest
+	}
+	return h.history.replay(codecName, from, latest)
+}
+
+// Recent returns the newest n history packets for a codec, flagged catchup.
+func (h *Hub) Recent(codecName string, n int) []Packet {
+	if n <= 0 {
+		return nil
+	}
+	oldest, latest, ok := h.history.bounds()
+	if !ok {
+		return nil
+	}
+	from := latest - uint16(n-1)
+	if proto.SeqDiff(oldest, from) < 0 {
+		from = oldest
+	}
+	return h.history.replay(codecName, from, latest)
 }

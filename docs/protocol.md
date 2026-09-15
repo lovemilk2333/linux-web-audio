@@ -96,7 +96,8 @@ Capability discovery. Consult this before opening the stream.
   "uptime_seconds": 36.5,
   "capture_reopens": 0,
   "header_size": 16,
-  "timestamp_unit": "samples"
+  "timestamp_unit": "samples",
+  "encode_us": 180
 }
 ```
 
@@ -107,20 +108,27 @@ devices, and `capture_reopens` counts how often that has happened.
 `oldest_seq`/`current_seq` describe the resume window. A `from_seq` outside
 `[oldest_seq, current_seq]` is refused.
 
+`encode_us` is an exponential moving average of how long `Encode()` took, in
+microseconds. libopus already uses SIMD; a 5 ms frame is too short for a GPU
+round trip, so this is what to watch instead of rewriting the encoder.
+
 ## GET /audio/stream
 
 | Query parameter | Meaning |
 | --- | --- |
 | `codec` | one of `codecs`; defaults to the server's `--codec` |
 | `from_seq` (or `seq`) | resume at this sequence number; omitted means join at the live edge |
+| `buffer_ms` | the client's play-buffer target, in milliseconds. The server prefills that much history at 2× on a live join, paces a backlog at 2× until it is 5 ms ahead then 1.25×, and drops to 0.75× once the extra lead reaches this value. After a discontinuity on the same connection it prefills again, so a FastForward jump can refill the play buffer instead of leaving it to drain at live 1×. Omitted or invalid means no prefill and no 0.75× cap, so CLI clients keep joining at the live edge. |
 | `token` | bearer token, **WebSocket only**. Browsers cannot set `Authorization` on `WebSocket()`, so the handshake carries the secret here. It will appear in reverse-proxy access logs. HTTP clients should keep using `Authorization: Bearer`. `/audio/info` does not accept this. |
 
 A `Upgrade: websocket` handshake is accepted **after** the codec and resume
 point have been checked. One binary message is then sent per packet: the same
 16-byte header plus payload, no extra framing, no permessage-deflate. 400 / 416
 / 401 stay ordinary HTTP JSON — the browser `WebSocket` constructor cannot read
-those headers, so a page that sees the handshake fail should retry with `fetch`
-for that attempt (which is how a 416 still reports the resume range).
+those headers. The page is WebSocket-only: a refused resume (`from_seq` the
+server no longer holds) retries the handshake at the live edge. The HTTP
+chunked body is still what `webclient` and any client that cannot open a
+WebSocket read.
 
 ### Responses
 
