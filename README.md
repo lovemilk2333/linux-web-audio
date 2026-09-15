@@ -8,7 +8,7 @@ over a long-lived HTTP response to any number of clients.
 ```
 default sink's monitor
   └─(pa_simple_read)  libwebaudio.so ── installed separately, GPL-3.0
-       └─(cgo)  one 20 ms frame at a time
+       └─(cgo)  one 5 ms frame at a time
             └─ hub: assign seq + sample timestamp, encode once per codec,
                     record history, fan out to every client
                  └─ HTTP chunked: 16-byte header + one encoded packet
@@ -144,8 +144,8 @@ is for.
 
 ```
 --listen 127.0.0.1:8642     --base-path /backend      --codec opus
---bitrate 96000             --frame-duration 10       --sample-rate 48000
---complexity 5              --channels 2              --sink ""
+--bitrate 96000             --frame-duration 5        --sample-rate 48000
+--complexity 3              --channels 2              --sink ""
 --history-packets 750       --client-queue 64         --slow-client fast-forward
 --token ""                  --token-file ""           --cors ""
 --allowed-hosts ""          --allow-anonymous

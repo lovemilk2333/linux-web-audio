@@ -82,6 +82,17 @@ class PlayerProcessor extends AudioWorkletProcessor {
     this.lastRefillAt = 0
 
     /**
+     * One sample waiting to be written at the start of the next block.
+     *
+     * Repeating a frame needs a free slot in the current output. When a chunk
+     * boundary lands exactly on the end of a render quantum there is none, and
+     * without this the owed repeat is deferred until some later boundary that
+     * happens to fall mid-block — which systematically under-repeats and is
+     * why a 20 ms target still dipped to a few milliseconds.
+     */
+    this.pendingRepeat = null
+
+    /**
      * True while there is no stream to play.
      *
      * The audio thread is still called, and would otherwise count every block
@@ -151,6 +162,7 @@ class PlayerProcessor extends AudioWorkletProcessor {
         this.refills = 0
         this.lowSince = 0
         this.lastRefillAt = 0
+        this.pendingRepeat = null
         this.playing = false
         break
       default:
@@ -263,20 +275,23 @@ class PlayerProcessor extends AudioWorkletProcessor {
      * At 0.001 the integrator could only sustain the measured ~32 repeated
      * frames/s by sitting at |errorRatio| ≈ 0.67 — one third of the target —
      * so a 100 ms buffer meant ~33 ms and still sawtoothed into underruns.
-     * 0.004 puts the same drift at |errorRatio| ≈ 0.17, about 83% of target.
+     * 0.008 puts the same drift at |errorRatio| ≈ 0.08, about 92% of target,
+     * which matters most for thin buffers: a 20 ms target with the weaker
+     * 0.004 gain still dipped to a few milliseconds and clicked.
      *
-     * Below half the target the shortfall is counted twice, so the reader
-     * spends its one-frame-per-boundary budget recovering reserve instead of
-     * hovering near empty. That band never stops playback; it only shapes
-     * the corrector. */
+     * Below three quarters of the target the shortfall is counted twice, so
+     * the reader spends its one-frame-per-boundary budget recovering reserve
+     * instead of hovering near empty. That band never stops playback; it only
+     * shapes the corrector. */
     const target = Math.max(1, this.targetFrames)
     const ratio = this.buffered / target
-    const errorRatio = ratio >= 0.5 ? ratio - 1 : (ratio - 1) * 2
-    this.correction = Math.max(-4, Math.min(4, this.correction + errorRatio * wanted * 0.004))
+    const errorRatio = ratio >= 0.75 ? ratio - 1 : (ratio - 1) * 2
+    this.correction = Math.max(-4, Math.min(4, this.correction + errorRatio * wanted * 0.008))
 
     if (this.idle && this.buffered === 0) {
       for (let channel = 0; channel < output.length; channel++) output[channel].fill(0)
       this.playing = false
+      this.pendingRepeat = null
       this.report(wanted)
       return true
     }
@@ -286,10 +301,20 @@ class PlayerProcessor extends AudioWorkletProcessor {
         // Still filling. Output silence, but do not count it as a dropout:
         // nothing has been dropped and nothing is late.
         for (let channel = 0; channel < output.length; channel++) output[channel].fill(0)
+        this.pendingRepeat = null
         this.report(wanted)
         return true
       }
       this.playing = true
+    }
+
+    if (this.pendingRepeat && written < wanted) {
+      for (let channel = 0; channel < output.length; channel++) {
+        output[channel][written] = this.pendingRepeat[Math.min(channel, this.pendingRepeat.length - 1)]
+      }
+      written += 1
+      this.correction = Math.min(4, this.correction + 1)
+      this.pendingRepeat = null
     }
 
     while (written < wanted && this.queue.length > 0) {
@@ -343,17 +368,27 @@ class PlayerProcessor extends AudioWorkletProcessor {
         this.offset = 0
 
         /* At most one frame of correction per boundary, which bounds the
-         * artefact rate no matter how wrong the level is. */
+         * artefact rate no matter how wrong the level is. A owed repeat that
+         * finds the block already full is deferred to the next block rather
+         * than dropped — otherwise boundaries that land on a quantum edge
+         * silently refuse to correct. */
         if (this.correction >= 1 && this.queue.length > 0 && this.queue[0][0].length > 1) {
           this.offset = 1
           this.buffered -= 1
           this.correction -= 1
-        } else if (this.correction <= -1 && written < wanted && written > 0) {
-          for (let channel = 0; channel < output.length; channel++) {
-            output[channel][written] = output[channel][written - 1]
+        } else if (this.correction <= -1 && written > 0) {
+          if (written < wanted) {
+            for (let channel = 0; channel < output.length; channel++) {
+              output[channel][written] = output[channel][written - 1]
+            }
+            written += 1
+            this.correction += 1
+          } else if (!this.pendingRepeat) {
+            this.pendingRepeat = []
+            for (let channel = 0; channel < output.length; channel++) {
+              this.pendingRepeat.push(output[channel][written - 1])
+            }
           }
-          written += 1
-          this.correction += 1
         }
       }
     }

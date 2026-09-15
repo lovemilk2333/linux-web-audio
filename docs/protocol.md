@@ -52,10 +52,10 @@ either resync or resample across it.
 ## Sequence numbers and timestamps
 
 `seq` increments by exactly one per packet and wraps at 65536, so at the default
-20 ms frame it wraps every ~22 minutes.
+5 ms frame it wraps every ~5.5 minutes.
 
 `timestamp` is **not** wall clock. It counts samples at the stream's sample rate
-and advances by exactly `frame_samples` per packet — 960 at the default — and it
+and advances by exactly `frame_samples` per packet — 240 at the default — and it
 keeps advancing through silence. It is therefore an exact media clock: a client
 can convert a timestamp difference straight into a duration, and can detect a
 gap by comparing the timestamp step against `frame_samples` rather than trusting
@@ -82,8 +82,8 @@ Capability discovery. Consult this before opening the stream.
   "codecs": ["opus", "pcm_f32le", "pcm_s16le"],
   "sample_rate": 48000,
   "channels": 2,
-  "frame_samples": 960,
-  "frame_duration_ms": 20,
+  "frame_samples": 240,
+  "frame_duration_ms": 5,
   "bitrate": 96000,
   "sink": "alsa_output.pci-0000_01_00.1.hdmi-stereo-extra1",
   "monitor": "alsa_output.pci-0000_01_00.1.hdmi-stereo-extra1.monitor",
@@ -124,8 +124,8 @@ Transfer-Encoding: chunked
 X-Audio-Codec: opus
 X-Audio-SampleRate: 48000
 X-Audio-Channels: 2
-X-Audio-Frame-Samples: 960
-X-Audio-Frame-Duration-Ms: 20
+X-Audio-Frame-Samples: 240
+X-Audio-Frame-Duration-Ms: 5
 X-Audio-Header-Size: 16
 X-Audio-Seq-Start: 1795
 ```
@@ -176,8 +176,8 @@ This is the flow the protocol is built around.
    from there and accept a gap, or start live and accept a gap of a different
    size. Either way you know a gap happened, which is the point.
 
-The server holds `history_packets` packets — 750 by default, about 15 seconds at
-the default frame duration.
+The server holds `history_packets` packets — 750 by default, about 3.8 seconds at
+the default 5 ms frame duration.
 
 A worked example, from the reference client:
 
@@ -200,10 +200,10 @@ resume result:
 | `pcm_s16le` | raw int16 | 16-bit signed, interleaved, clamped rather than wrapped. |
 
 The PCM codecs have a payload length that is exactly
-`frame_samples * channels * bytes_per_sample` — 3840 bytes for `pcm_s16le` and
-7680 for `pcm_f32le` at the default format. Any other length is a framing bug,
-which makes them the useful codecs for debugging a client. At 48 kHz stereo they
-cost about 1.5 and 3 Mbps respectively.
+`frame_samples * channels * bytes_per_sample` — 960 bytes for `pcm_s16le` and
+1920 for `pcm_f32le` at the default 5 ms frame. Any other length is a framing
+bug, which makes them the useful codecs for debugging a client. At 48 kHz stereo
+they cost about 1.5 and 3 Mbps respectively.
 
 Note that Opus needs no container here: each payload is one self-contained
 packet and the header supplies the timing, so a client hands the payload

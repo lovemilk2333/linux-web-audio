@@ -172,8 +172,8 @@ const insecureRemedy = computed(() => {
  * to whole milliseconds would put the floor at 6 ms for a stream whose frames
  * are 2.5 ms, when 5 ms is exactly two of them. */
 const targetStepMs = computed(() => {
-  const ms = info.value?.frame_duration_ms ?? 20
-  return ms > 0 ? ms : 20
+  const ms = info.value?.frame_duration_ms ?? 5
+  return ms > 0 ? ms : 5
 })
 
 /** Frames per Web Audio render block; process() is always handed this many. */
@@ -331,7 +331,7 @@ async function refreshInfo(): Promise<ServerInfo> {
   // value from a previous session may no longer land on one. A null follows
   // the floor by itself and needs nothing doing to it.
   if (settings.targetMs !== null) {
-    const step = fetched.frame_duration_ms > 0 ? fetched.frame_duration_ms : 20
+    const step = fetched.frame_duration_ms > 0 ? fetched.frame_duration_ms : 5
     const blockMs = ((6 * RENDER_QUANTUM) / (fetched.sample_rate || 48000)) * 1000
     const floor = Math.ceil(Math.max(step * 2, blockMs) / step) * step
     settings.targetMs = Math.max(Math.round(settings.targetMs / step) * step, floor)

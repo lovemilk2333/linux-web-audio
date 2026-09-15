@@ -104,12 +104,16 @@ alternative was a 20 ms dropout every fifteen seconds.
 The corrector's gain is set so the steady level sits near the target rather
 than a third of the way down it (which is where a weaker loop settled, and
 why a 100 ms target still sawtoothed into underruns after the first fix).
-Below half the target the shortfall is weighted harder, so reserve is rebuilt
-at the one-frame-per-boundary cap before the buffer gets near empty. An early
-refill at about one render quantum (~4 ms), with a short dwell and a one-second
-cooldown, is only a safety net: it does not replace the corrector, and it is
-kept far below ordinary burst jitter so it cannot thrash the way a level
-threshold near the setpoint did.
+Below three quarters of the target the shortfall is weighted harder, so
+reserve is rebuilt at the one-frame-per-boundary cap before the buffer gets
+near empty. A repeat that finds the current render block already full is
+deferred into the next block rather than dropped — otherwise boundaries that
+land on a quantum edge silently refuse to correct, which left a 20 ms target
+dipping to a few milliseconds and clicking. An early refill at about one
+render quantum (~4 ms), with a short dwell and a one-second cooldown, is only
+a safety net: it does not replace the corrector, and it is kept far below
+ordinary burst jitter so it cannot thrash the way a level threshold near the
+setpoint did.
 
 The `correction` value in `window.__webaudio.player` shows what the corrector is
 currently doing, and `enqueuedFrames` against `playedFrames` is how the drift
