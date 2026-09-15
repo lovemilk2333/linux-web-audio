@@ -102,6 +102,22 @@ describe('StreamStats', () => {
     expect(stats.discontinuity).toBe(1)
   })
 
+  it('does not treat catchup history as a gap or a reorder', () => {
+    const stats = new StreamStats(FRAME_SAMPLES)
+    stats.observe(frame(10, 0))
+    stats.observe(frame(20, 10 * FRAME_SAMPLES, Flag.Discontinuity))
+    stats.observe(frame(16, 6 * FRAME_SAMPLES, Flag.Catchup))
+    stats.observe(frame(17, 7 * FRAME_SAMPLES, Flag.Catchup))
+
+    expect(stats.gaps).toBe(1)
+    expect(stats.missing).toBe(9)
+    expect(stats.outOfOrder).toBe(0)
+    expect(stats.duplicates).toBe(0)
+    // The live jump itself is a clock step; the catchup that follows is not.
+    expect(stats.clockJumps).toBe(1)
+    expect(stats.catchup).toBe(2)
+  })
+
   it('turns packets into a duration using the sample rate', () => {
     const stats = new StreamStats(FRAME_SAMPLES)
     stats.sampleRate = 48000

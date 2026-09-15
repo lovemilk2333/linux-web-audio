@@ -41,8 +41,14 @@ export interface PlayerStatus {
   playedFrames: number
   contextRate: number
   streamRate: number
-  /** Frames owed to the drift corrector; near zero when the clocks agree. */
+  /**
+   * Samples the reader owes the target: negative is short and being paid in
+   * repeated samples, positive is long and being paid in skipped ones. Near
+   * zero when the level is where it should be.
+   */
   correction: number
+  /** Times a drained buffer was filled by looping recent audio. */
+  loops: number
 }
 
 const IDLE_STATUS: PlayerStatus = {
@@ -62,6 +68,7 @@ const IDLE_STATUS: PlayerStatus = {
   contextRate: 0,
   streamRate: 0,
   correction: 0,
+  loops: 0,
 }
 
 /**
@@ -112,14 +119,14 @@ export class Player {
       context = new AudioContext()
     }
 
-    /* AudioWorklet, like WebCodecs, exists only in a secure context. Over plain
-     * HTTP from anywhere but localhost the property is simply absent, and
-     * calling addModule on it throws "cannot read properties of undefined" —
-     * which says nothing about the actual problem. */
+    /* AudioWorklet exists only in a secure context. Over plain HTTP from
+     * anywhere but localhost the property is simply absent, and calling
+     * addModule on it throws "cannot read properties of undefined" — which
+     * says nothing about the actual problem. */
     if (!context.audioWorklet) {
       throw new Error(
         `this page has no AudioWorklet, because ${location.origin} is not a secure context. ` +
-          'Browsers provide audio worklets (and WebCodecs) only over https:// or on localhost. ' +
+          'Browsers provide audio worklets only over https:// or on localhost. ' +
           'Serving the page over plain http:// from another host strips them. See the README.',
       )
     }
@@ -173,6 +180,7 @@ export class Player {
         contextRate: message.contextRate ?? 0,
         streamRate: message.streamRate ?? 0,
         correction: message.correction ?? 0,
+        loops: message.loops ?? 0,
       }
       for (const listener of this.listeners) listener(this.status)
     }
@@ -219,6 +227,25 @@ export class Player {
    */
   setIdle(idle: boolean): void {
     this.node?.port.postMessage({ type: 'idle', idle })
+  }
+
+  /**
+   * After playback has started, loop a short stretch of what just played
+   * when the buffer runs dry, instead of outputting silence. Off by
+   * default. Preroll and reconnect still wait for the target in silence.
+   */
+  setLoopOnUnderrun(enabled: boolean): void {
+    this.node?.port.postMessage({ type: 'loop', enabled })
+  }
+
+  /**
+   * Drops queued audio without resetting the counters.
+   *
+   * Used on reconnect so preroll waits for a fresh target instead of
+   * splicing the last session onto the server's prefill.
+   */
+  flush(): void {
+    this.node?.port.postMessage({ type: 'flush' })
   }
 
   /** Clears queued audio and the counters. */

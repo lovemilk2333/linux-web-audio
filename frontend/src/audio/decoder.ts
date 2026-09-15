@@ -5,16 +5,14 @@ import type { Frame } from './protocol'
 /**
  * Turns the payload of a frame into planar float samples.
  *
- * Opus has two decode paths, because WebCodecs is not everywhere. It is the
- * better one where it exists — native, no download — but a browser without it
- * would otherwise have to fall back to the server's raw PCM, which costs about
- * sixteen times the bandwidth. A WASM build of libopus fills that gap at 96
- * kbps instead of 1.5 Mbps, and is fetched only when it is needed.
+ * Opus has two decode paths. WebCodecs is native and needs no download, but
+ * AudioDecoder queues: measured, samples come out ~130 ms after decode() on a
+ * 5 ms stream, which is most of a live budget. A WASM build of libopus
+ * decodes synchronously in well under a millisecond, so that is the default.
+ * WebCodecs is the fallback when the WASM module cannot load.
  *
- * So, in order of preference:
- *
- *   opus      → WebCodecs AudioDecoder      native, no download
  *   opus      → opus-decoder (WASM libopus) ~85 KiB, fetched on demand
+ *   opus      → WebCodecs AudioDecoder      native, but internally queued
  *   pcm_*     → nothing to decode           last resort, ~1.5 Mbps
  */
 
@@ -26,7 +24,26 @@ export interface Decoder {
   decode(frame: Frame): void
   /** Packets handed over but not yet decoded. */
   readonly backlog: number
+  /** Exponential moving average of decode(), in milliseconds. Zero until the first packet. */
+  readonly decodeMs: number
+  /**
+   * Drops in-flight timing so a reconnect cannot fold the stall into decodeMs.
+   *
+   * WebCodecs measures from decode() to the output callback. Packets handed
+   * over just before the socket dies sit in that map for the whole backoff,
+   * and the first sample after resume would otherwise read as hundreds of
+   * milliseconds of "decode".
+   */
+  resetTiming(): void
   close(): void
+}
+
+/** Longer than any real 5 ms Opus decode; a stall or a queued WebCodecs burst. */
+const DECODE_MS_CAP = 40
+
+function foldDecodeMs(prev: number, elapsedMs: number): number {
+  if (!Number.isFinite(elapsedMs) || elapsedMs < 0 || elapsedMs > DECODE_MS_CAP) return prev
+  return prev === 0 ? elapsedMs : (prev * 7 + elapsedMs) / 8
 }
 
 export interface StreamFormat {
@@ -40,8 +57,9 @@ export type OpusPath = 'webcodecs' | 'wasm' | 'none'
 /**
  * What it would take to decode Opus in this browser.
  *
- * The WASM decoder is not loaded to answer this: it is a download, so the
- * question is only whether it could be.
+ * WASM is the live path (see createDecoder). This still reports WebCodecs
+ * when it exists, so the UI can say the native decoder is available as a
+ * fallback; the module is not loaded to answer that.
  */
 export async function opusPath(format: StreamFormat): Promise<OpusPath> {
   if (await webCodecsOpusSupported(format)) return 'webcodecs'
@@ -66,13 +84,11 @@ export async function webCodecsOpusSupported(format: StreamFormat): Promise<bool
 /**
  * Picks a codec the server offers and this browser can actually play.
  *
- * Opus is preferred for bandwidth, and there are two ways to decode it. Raw
- * PCM is the last resort: it needs nothing from the browser, and costs about
- * sixteen times as much.
+ * Opus is preferred for bandwidth. Raw PCM is the last resort: it needs
+ * nothing from the browser, and costs about sixteen times as much.
  */
 export async function chooseCodec(
   offered: readonly string[],
-  format: StreamFormat,
   preferred?: string,
 ): Promise<{ codec: string; reason: string }> {
   const has = (name: string) => offered.includes(name)
@@ -82,13 +98,9 @@ export async function chooseCodec(
   }
 
   if (has('opus')) {
-    const path = await opusPath(format)
     return {
       codec: 'opus',
-      reason:
-        path === 'webcodecs'
-          ? 'WebCodecs decodes Opus natively here'
-          : 'no WebCodecs here, so Opus is decoded by a WASM build of libopus',
+      reason: 'Opus is decoded by a WASM build of libopus (WebCodecs queues ~100 ms of audio)',
     }
   }
 
@@ -118,10 +130,14 @@ export async function createDecoder(
 ): Promise<Decoder> {
   switch (codec) {
     case 'opus':
-      if (await webCodecsOpusSupported(format)) {
-        return new WebCodecsOpusDecoder(format, sink, onError)
+      try {
+        return await WasmOpusDecoder.create(format, sink)
+      } catch (cause) {
+        if (await webCodecsOpusSupported(format)) {
+          return new WebCodecsOpusDecoder(format, sink, onError)
+        }
+        throw cause
       }
-      return WasmOpusDecoder.create(format, sink, onError)
     case 'pcm_s16le':
       return new PcmDecoder(format, sink, 2)
     case 'pcm_f32le':
@@ -144,6 +160,8 @@ class WebCodecsOpusDecoder implements Decoder {
   private decoder: AudioDecoder
   private closed = false
   private dropped = 0
+  decodeMs = 0
+  private pending = new Map<number, number>()
 
   constructor(
     private format: StreamFormat,
@@ -170,6 +188,11 @@ class WebCodecsOpusDecoder implements Decoder {
     return this.dropped
   }
 
+  resetTiming(): void {
+    this.pending.clear()
+    this.decodeMs = 0
+  }
+
   decode(frame: Frame): void {
     if (this.closed) return
 
@@ -180,12 +203,14 @@ class WebCodecsOpusDecoder implements Decoder {
       return
     }
 
+    const timestamp = Math.round((frame.timestamp / this.format.sampleRate) * 1_000_000)
+    this.pending.set(timestamp, performance.now())
     this.decoder.decode(
       new EncodedAudioChunk({
         // Every Opus packet is independently decodable, so all of them are
         // key frames as far as WebCodecs is concerned.
         type: 'key',
-        timestamp: Math.round((frame.timestamp / this.format.sampleRate) * 1_000_000),
+        timestamp,
         data: frame.payload,
       }),
     )
@@ -193,6 +218,11 @@ class WebCodecsOpusDecoder implements Decoder {
 
   private emit(data: AudioData): void {
     try {
+      const started = this.pending.get(data.timestamp)
+      if (started !== undefined) {
+        this.pending.delete(data.timestamp)
+        this.decodeMs = foldDecodeMs(this.decodeMs, performance.now() - started)
+      }
       const frames = data.numberOfFrames
       const channels: Float32Array[] = []
       for (let c = 0; c < this.format.channels; c++) {
@@ -220,17 +250,15 @@ class WebCodecsOpusDecoder implements Decoder {
 /**
  * Opus through a WASM build of libopus.
  *
- * For browsers without WebCodecs. It costs an ~85 KiB download, so the import
- * is dynamic: Vite puts it in its own chunk and a browser that can use
- * WebCodecs never fetches it.
- *
- * Unlike the WebCodecs path this decodes synchronously, which is fine — a
- * 20 ms packet takes microseconds — and means packets cannot pile up behind an
- * asynchronous queue.
+ * The live path: a 5 ms packet takes microseconds, synchronously, so nothing
+ * piles up behind an asynchronous queue. The import is dynamic so a PCM-only
+ * session never fetches the ~85 KiB module. WebCodecs is the fallback when
+ * this cannot load.
  */
 class WasmOpusDecoder implements Decoder {
   readonly codec = 'opus'
   private closed = false
+  decodeMs = 0
 
   private constructor(
     private decoder: OpusDecoderInstance,
@@ -239,25 +267,16 @@ class WasmOpusDecoder implements Decoder {
   ) {}
 
   /** Loads the WASM module and prepares a decoder. */
-  static async create(
-    format: StreamFormat,
-    sink: SampleSink,
-    onError: (error: Error) => void,
-  ): Promise<WasmOpusDecoder> {
-    try {
-      // Dynamic on purpose: this is the whole point of the tier.
-      const { OpusDecoder } = await import('opus-decoder')
-      const decoder = new OpusDecoder({
-        sampleRate: wasmSampleRate(format.sampleRate),
-        channels: format.channels,
-      })
-      await decoder.ready
-      return new WasmOpusDecoder(decoder, format, sink)
-    } catch (cause) {
-      const error = cause instanceof Error ? cause : new Error(String(cause))
-      onError(new Error(`could not load the Opus decoder: ${error.message}`))
-      throw error
-    }
+  static async create(format: StreamFormat, sink: SampleSink): Promise<WasmOpusDecoder> {
+    // Dynamic on purpose: this is the whole point of the tier. Failure
+    // bubbles to createDecoder, which tries WebCodecs before giving up.
+    const { OpusDecoder } = await import('opus-decoder')
+    const decoder = new OpusDecoder({
+      sampleRate: wasmSampleRate(format.sampleRate),
+      channels: format.channels,
+    })
+    await decoder.ready
+    return new WasmOpusDecoder(decoder, format, sink)
   }
 
   get backlog(): number {
@@ -265,10 +284,16 @@ class WasmOpusDecoder implements Decoder {
     return 0
   }
 
+  resetTiming(): void {
+    this.decodeMs = 0
+  }
+
   decode(frame: Frame): void {
     if (this.closed) return
 
+    const started = performance.now()
     const { channelData, samplesDecoded } = this.decoder.decodeFrame(frame.payload)
+    this.decodeMs = foldDecodeMs(this.decodeMs, performance.now() - started)
     if (samplesDecoded === 0) return
 
     /* Copied, necessarily. channelData are views into the WASM heap and are
@@ -327,6 +352,7 @@ interface OpusDecoderInstance {
  */
 class PcmDecoder implements Decoder {
   readonly codec: string
+  decodeMs = 0
 
   constructor(
     private format: StreamFormat,
@@ -340,8 +366,14 @@ class PcmDecoder implements Decoder {
     return 0
   }
 
+  resetTiming(): void {
+    this.decodeMs = 0
+  }
+
   decode(frame: Frame): void {
+    const started = performance.now()
     const { channels, frames } = deinterleave(frame.payload, this.format.channels, this.bytesPerSample)
+    this.decodeMs = foldDecodeMs(this.decodeMs, performance.now() - started)
     this.sink(channels, frames)
   }
 

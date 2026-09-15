@@ -8,7 +8,7 @@ import SettingsPanel from './components/SettingsPanel.vue'
 import StatsPanel from './components/StatsPanel.vue'
 
 import { Flag } from './audio/protocol'
-import { chooseCodec, createDecoder, opusPath, type Decoder, type StreamFormat } from './audio/decoder'
+import { chooseCodec, createDecoder, type Decoder, type StreamFormat } from './audio/decoder'
 import { clampGainDb, dbToLinear } from './audio/gain'
 import { Player, type PlayerStatus } from './audio/player'
 import { StreamStats } from './stats'
@@ -31,6 +31,11 @@ interface Settings {
   /** Playback gain in decibels; not a secret, so it is remembered. */
   gainDb: number
   resume: boolean
+  /**
+   * Loop a short stretch of recently played audio when the buffer runs dry.
+   * Off by default: it hides a stall as a stutter rather than a click.
+   */
+  loopOnUnderrun: boolean
   theme: 'system' | 'light' | 'dark'
 }
 
@@ -46,6 +51,7 @@ function loadSettings(): Settings {
     targetMs: null,
     gainDb: 0,
     resume: true,
+    loopOnUnderrun: false,
     theme: 'system',
   }
 
@@ -85,8 +91,6 @@ const error = ref<string | null>(null)
 const busy = ref(false)
 const entries = ref<LogEntry[]>([])
 const playableCodecs = ref<string[]>([])
-/** How Opus will be decoded here, once the server's format is known. */
-const opusDecodePath = ref<'webcodecs' | 'wasm' | 'none'>('none')
 /** Bumped on a timer so the stats panel re-renders; its data mutates in place. */
 const tick = ref(0)
 /** Replayed packets not decoded, because the buffer already held enough. */
@@ -129,6 +133,7 @@ const playerStatus = reactive<PlayerStatus>({
   contextRate: 0,
   streamRate: 0,
   correction: 0,
+  loops: 0,
 })
 
 /* Bound once for the template. Deliberately not named `location`: that would
@@ -152,9 +157,9 @@ let logId = 0
 
 const connected = computed(() => state.value === 'streaming' || state.value === 'reconnecting')
 
-/* Both AudioWorklet and WebCodecs are secure-context-only. Rather than let the
- * user find that out as a TypeError when they press connect, say so on arrival
- * and give the ways out. */
+/* AudioWorklet is secure-context-only. Rather than let the user find that
+ * out as a TypeError when they press connect, say so on arrival and give
+ * the ways out. */
 const insecureContext = computed(() => !window.isSecureContext)
 const insecureRemedy = computed(() => {
   const port = pageLocation.port || '4173'
@@ -228,6 +233,7 @@ watch(
             targetMs: settings.targetMs,
             gainDb: settings.gainDb,
             resume: settings.resume,
+            loopOnUnderrun: settings.loopOnUnderrun,
             theme: settings.theme,
           }),
         )
@@ -244,6 +250,12 @@ watch(
 const effectiveTargetMs = computed(() => settings.targetMs ?? minTargetMs.value)
 
 watch(effectiveTargetMs, (ms) => player.setTargetMs(ms))
+
+watch(
+  () => settings.loopOnUnderrun,
+  (enabled) => player.setLoopOnUnderrun(enabled),
+  { immediate: true },
+)
 
 watch(
   () => settings.theme,
@@ -296,6 +308,17 @@ onMounted(async () => {
 
   const ticker = window.setInterval(() => {
     tick.value++
+    if (decoder) stats.value.decodeMs = decoder.decodeMs
+    if (tick.value % 10 === 0 && connected.value) {
+      const started = performance.now()
+      void fetchInfo(settings.baseUrl, token.value)
+        .then((fetched) => {
+          info.value = fetched
+          stats.value.encodeMs = (fetched.encode_us ?? 0) / 1000
+          stats.value.rttMs = performance.now() - started
+        })
+        .catch(() => undefined)
+    }
   }, 200)
   onBeforeUnmount(() => window.clearInterval(ticker))
 
@@ -323,8 +346,10 @@ onBeforeUnmount(() => {
 })
 
 async function refreshInfo(): Promise<ServerInfo> {
+  const started = performance.now()
   const fetched = await fetchInfo(settings.baseUrl, token.value)
   info.value = fetched
+  stats.value.rttMs = performance.now() - started
 
   // An explicit choice can fall outside what this server allows: a longer
   // frame duration moves the floor up, and any duration moves the step, so a
@@ -337,14 +362,11 @@ async function refreshInfo(): Promise<ServerInfo> {
     settings.targetMs = Math.max(Math.round(settings.targetMs / step) * step, floor)
   }
 
-  const format: StreamFormat = { sampleRate: fetched.sample_rate, channels: fetched.channels }
-
-  // Opus is playable either way — natively where WebCodecs exists, otherwise
-  // through the WASM decoder — so everything the server offers is playable.
+  // Opus is playable through the WASM decoder (WebCodecs is the fallback
+  // if that module cannot load), so everything the server offers is playable.
   const playable: string[] = []
   if (fetched.codecs.includes('opus')) {
     playable.push('opus')
-    opusDecodePath.value = await opusPath(format)
   }
   for (const name of ['pcm_s16le', 'pcm_f32le']) {
     if (fetched.codecs.includes(name)) playable.push(name)
@@ -373,7 +395,6 @@ async function connect({ reconnecting = false } = {}): Promise<void> {
     const format: StreamFormat = { sampleRate: fetched.sample_rate, channels: fetched.channels }
     const chosen = await chooseCodec(
       fetched.codecs,
-      format,
       settings.codec && playableCodecs.value.includes(settings.codec) ? settings.codec : undefined,
     )
     settings.codec = chosen.codec
@@ -388,6 +409,7 @@ async function connect({ reconnecting = false } = {}): Promise<void> {
       // The graph is new, so the gain the watcher pushed earlier went with the
       // old one.
       player.setGain(dbToLinear(gainDb.value))
+      player.setLoopOnUnderrun(settings.loopOnUnderrun)
       if (rate !== format.sampleRate) {
         log(
           'error',
@@ -399,11 +421,20 @@ async function connect({ reconnecting = false } = {}): Promise<void> {
     if (!reconnecting) {
       stats.value = new StreamStats(fetched.frame_samples)
       stats.value.sampleRate = fetched.sample_rate
+      stats.value.encodeMs = (fetched.encode_us ?? 0) / 1000
       stats.value.start()
       skipped.value = 0
       inReplay = false
       replayBudgetFrames = 0
       player.reset()
+    } else {
+      // dropConnection() tears the reader down and builds a new one, so
+      // onReconnect never ran. Flush here too: leftover audio spliced onto
+      // the prefill is the same stutter.
+      decoder?.resetTiming()
+      stats.value.decodeMs = 0
+      player.flush()
+      player.setIdle(true)
     }
 
     decoder?.close()
@@ -414,8 +445,9 @@ async function connect({ reconnecting = false } = {}): Promise<void> {
     try {
       decoder = await createDecoder(activeCodec, format, sink, onDecodeError)
     } catch (cause) {
-      // Most likely the WASM decoder could not be fetched. Falling back to raw
-      // PCM keeps audio playing at a cost in bandwidth, which beats silence.
+      // Most likely the WASM decoder could not be fetched, and WebCodecs was
+      // not there either. Falling back to raw PCM keeps audio playing at a
+      // cost in bandwidth, which beats silence.
       const fallback = fetched.codecs.find((name) => name.startsWith('pcm_'))
       if (activeCodec !== 'opus' || !fallback) throw cause
 
@@ -434,8 +466,19 @@ async function connect({ reconnecting = false } = {}): Promise<void> {
       token: token.value,
       resume: settings.resume,
       resumeFrom,
+      bufferMs: effectiveTargetMs.value,
+      onReconnect: () => {
+        decoder?.resetTiming()
+        stats.value.decodeMs = 0
+        // Drop leftover audio and wait for a fresh target. Looping the last
+        // session, or splicing it onto the prefill, is the stutter the
+        // option is not for.
+        player.flush()
+        player.setIdle(true)
+      },
       onFrame: (frame) => {
         stats.value.observe(frame)
+        if (decoder) stats.value.decodeMs = decoder.decodeMs
 
         if (frame.flags & Flag.Catchup) {
           if (!inReplay) {
@@ -507,6 +550,7 @@ function dropConnection(): void {
   decoder?.close()
   decoder = null
   state.value = 'stopped'
+  player.flush()
   player.setIdle(true)
 
   globalThis.setTimeout(() => {
@@ -520,7 +564,7 @@ function dropConnection(): void {
     <header>
       <h1>linux-web-audio</h1>
       <p class="sub">
-        Desktop audio over an HTTP long connection. The page decodes it with WebCodecs where it can
+        Desktop audio over WebSocket. The page decodes Opus with a WASM build of libopus
         and plays it through an AudioWorklet.
       </p>
     </header>
@@ -528,7 +572,7 @@ function dropConnection(): void {
     <div v-if="insecureContext" class="banner bad">
       <strong>This page is not a secure context, so audio cannot play here.</strong>
       <p>
-        Browsers only expose the AudioWorklet and WebCodecs APIs over <code>https://</code> or on
+        Browsers only expose the AudioWorklet API over <code>https://</code> or on
         <code>localhost</code>. Loading the page from <code>{{ pageLocation.origin }}</code> strips both,
         so there is nothing to decode into and nothing to play through.
       </p>
@@ -560,6 +604,7 @@ function dropConnection(): void {
           :min-target-ms="minTargetMs"
           :target-step-ms="targetStepMs"
           v-model:resume="settings.resume"
+          v-model:loop-on-underrun="settings.loopOnUnderrun"
           v-model:theme="settings.theme"
           :repeatable="connected"
           @disconnect-now="dropConnection"

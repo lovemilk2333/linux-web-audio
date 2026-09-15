@@ -41,4 +41,15 @@ describe('streamURL', () => {
     const url = streamURL({ baseUrl: '', codec: 'opus', tokenQuery: undefined }, false)
     expect(url.searchParams.has('token')).toBe(false)
   })
+
+  it('puts a positive buffer target on the query and omits a missing one', () => {
+    const withBuffer = streamURL({ baseUrl: '', codec: 'opus', bufferMs: 20 }, true)
+    expect(withBuffer.searchParams.get('buffer_ms')).toBe('20')
+
+    const without = streamURL({ baseUrl: '', codec: 'opus' }, true)
+    expect(without.searchParams.has('buffer_ms')).toBe(false)
+
+    const zero = streamURL({ baseUrl: '', codec: 'opus', bufferMs: 0 }, false)
+    expect(zero.searchParams.has('buffer_ms')).toBe(false)
+  })
 })

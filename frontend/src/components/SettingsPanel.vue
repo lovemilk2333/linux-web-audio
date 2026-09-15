@@ -11,6 +11,8 @@ defineProps<{
   /** Playback gain in decibels. */
   gainDb: number
   resume: boolean
+  /** Loop a short stretch of recent audio when the buffer runs dry. Off by default. */
+  loopOnUnderrun: boolean
   theme: 'system' | 'light' | 'dark'
   repeatable: boolean
 }>()
@@ -19,6 +21,7 @@ const emit = defineEmits<{
   'update:targetMs': [number]
   'update:gainDb': [number]
   'update:resume': [boolean]
+  'update:loopOnUnderrun': [boolean]
   'update:theme': ['system' | 'light' | 'dark']
   disconnectNow: []
 }>()
@@ -34,9 +37,10 @@ const emit = defineEmits<{
         <p class="hint">
           How much audio to hold before playing starts. This is also the delay you hear: the buffer
           cannot fill faster than the source produces it, so a live stream always lags by roughly
-          this much. The worklet steers toward this level and keeps reserve under it, so ordinary
-          jitter does not drain the buffer to nothing. More absorbs stalls; less gets you closer to
-          live. Past twice this, the oldest audio is discarded to keep the delay from growing.
+          this much. The worklet steers back to this level by repeating or skipping single
+          samples, never by changing speed, so a hole is filled without stopping to rebuild and
+          without the pitch moving. More absorbs stalls; less gets you closer to live. Past twice
+          this, the oldest audio is discarded to keep the delay from growing.
         </p>
         <p class="hint detail">
           The step is one frame and the floor is {{ minTargetMs }} ms here, which is the default:
@@ -77,6 +81,26 @@ const emit = defineEmits<{
           :checked="resume"
           class="checkbox"
           @change="emit('update:resume', ($event.target as HTMLInputElement).checked)"
+        />
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="label-block">
+        <label for="loop-underrun">Loop on underrun</label>
+        <p class="hint">
+          After playback has started, fill a dry spell with about 40 ms of what just played
+          instead of silence. Off by default: it hides a stall as a stutter rather than a
+          click. Preroll and reconnect still wait for the target in silence.
+        </p>
+      </div>
+      <div class="control">
+        <input
+          id="loop-underrun"
+          type="checkbox"
+          :checked="loopOnUnderrun"
+          class="checkbox"
+          @change="emit('update:loopOnUnderrun', ($event.target as HTMLInputElement).checked)"
         />
       </div>
     </div>

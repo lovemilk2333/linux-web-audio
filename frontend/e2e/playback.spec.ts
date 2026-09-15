@@ -9,10 +9,11 @@ import { expect, test, type Page } from '@playwright/test'
  * They are excluded from `pnpm test` for that reason.
  *
  * What they cover is the part unit tests cannot reach: that the page talks to
- * the real server, that WebCodecs decodes what the server actually sends, and
- * that the worklet receiving those samples on the audio thread really plays
- * them. The numbers come from the page's own state rather than from scraped
- * text, so a formatting change cannot make a passing test meaningless.
+ * the real server, that the WASM Opus decoder decodes what the server actually
+ * sends, and that the worklet receiving those samples on the audio thread
+ * really plays them. The numbers come from the page's own state rather than
+ * from scraped text, so a formatting change cannot make a passing test
+ * meaningless.
  */
 
 /**
@@ -106,7 +107,7 @@ test.describe('playback', () => {
     expect(current.stats.missing, 'missing packets').toBe(0)
     expect(current.stats.clockJumps, 'timestamp steps that were not one frame').toBe(0)
 
-    // Opus, decoded by the browser rather than passed through.
+    // Opus, decoded here rather than passed through as PCM.
     expect(current.info?.codec).toBe('opus')
 
     // The audio thread is genuinely consuming what the page decoded.

@@ -35,6 +35,13 @@ const summary = computed(() => {
   return props.stats.summary()
 })
 
+function formatMs(value: number): string {
+  if (value <= 0) return '—'
+  if (value < 0.05) return '<0.05 ms'
+  if (value < 10) return `${value.toFixed(2)} ms`
+  return `${value.toFixed(1)} ms`
+}
+
 const rows = computed(() => {
   void props.tick
   const stats = props.stats
@@ -50,6 +57,56 @@ const rows = computed(() => {
     },
     { label: 'packets', value: stats.packets.toLocaleString() },
     { label: 'sequence', value: stats.firstSeq === null ? '—' : `${stats.firstSeq} → ${stats.lastSeq}` },
+  ]
+})
+
+const latency = computed(() => {
+  void props.tick
+  const stats = props.stats
+  const player = props.player
+  const encode = stats.encodeMs
+  const decode = stats.decodeMs
+  const rtt = stats.rttMs
+  const arrival = stats.arrivalMs
+  const jitter = stats.jitterMs
+  const buffer = player.bufferedMs
+  const endToEnd = encode + decode + buffer + rtt / 2
+  return [
+    {
+      label: 'encode',
+      value: formatMs(encode),
+      hint: 'server Encode() exponential moving average',
+    },
+    {
+      label: 'decode',
+      value: formatMs(decode),
+      hint: 'time from handing a packet to the decoder until samples come out',
+    },
+    {
+      label: 'network RTT',
+      value: formatMs(rtt),
+      hint: 'round trip of GET /audio/info; one-way is about half of this',
+    },
+    {
+      label: 'play buffer',
+      value: `${buffer.toFixed(0)} ms`,
+      hint: 'audio queued and not yet heard; this is most of the delay',
+    },
+    {
+      label: 'encode + decode + RTT/2 + buffer',
+      value: endToEnd > 0 ? `${endToEnd.toFixed(1)} ms` : '—',
+      hint: 'what this page can measure; RTT/2 stands in for the stream hop',
+    },
+    {
+      label: 'live interval',
+      value: formatMs(arrival),
+      hint: 'mean time between live packets; should match the frame duration',
+    },
+    {
+      label: 'jitter',
+      value: formatMs(jitter),
+      hint: 'RFC 3550-style interarrival jitter of live packets',
+    },
   ]
 })
 
@@ -134,6 +191,32 @@ const health = computed(() => {
     items.push({ label: 'gaps flagged', value: `${stats.discontinuity} packets`, tone: 'warn' })
   }
 
+  if (props.player.refills > 0) {
+    items.push({
+      label: 'refills',
+      value: `${props.player.refills} rebuilds`,
+      tone: 'warn',
+    })
+  }
+
+  if (props.player.loops > 0) {
+    items.push({
+      label: 'looped',
+      value: `${props.player.loops} blocks`,
+      tone: 'ok',
+    })
+  }
+
+  const jitter = stats.jitterMs
+  if (jitter > 0) {
+    const tone: 'ok' | 'warn' | 'bad' = jitter >= 10 ? 'bad' : jitter >= 3 ? 'warn' : 'ok'
+    items.push({
+      label: 'stability',
+      value: jitter < 3 ? 'steady' : `${jitter.toFixed(1)} ms jitter`,
+      tone,
+    })
+  }
+
   return items
 })
 
@@ -161,6 +244,14 @@ const bufferPercent = computed(() => {
     <div class="buffer">
       <div class="buffer-fill" :style="{ width: bufferPercent + '%' }" />
     </div>
+
+    <h2 class="spaced">Latency</h2>
+    <dl class="grid">
+      <template v-for="row in latency" :key="row.label">
+        <dt>{{ row.label }}</dt>
+        <dd class="mono" :title="row.hint">{{ row.value }}</dd>
+      </template>
+    </dl>
 
     <h2 class="spaced">Health</h2>
     <ul class="health">

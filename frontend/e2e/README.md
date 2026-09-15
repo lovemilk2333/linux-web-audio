@@ -31,8 +31,8 @@ because it is already installed and the download is a few hundred megabytes.
 
 - The page talks to the real server: `/audio/info` populates the codec list
   before anything is clicked.
-- WebCodecs decodes what the server actually sends, rather than what a test
-  fixture claims it sends.
+- The WASM Opus decoder decodes what the server actually sends, rather than
+  what a test fixture claims it sends.
 - The AudioWorklet receives those samples on the audio thread and plays them.
   `playedMs` is the worklet's own count of frames it has output, so it cannot
   be satisfied by the page merely deciding it played something.

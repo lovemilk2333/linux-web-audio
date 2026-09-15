@@ -34,9 +34,21 @@ export class StreamStats {
 
   /** Set by the caller once the server's format is known; turns packet counts into durations. */
   sampleRate = 48000
+  /** Exponential moving average of how long Encode() took on the server, in milliseconds. */
+  encodeMs = 0
+  /** Exponential moving average of how long decode() took here, in milliseconds. */
+  decodeMs = 0
+  /** Round trip of GET /audio/info, in milliseconds. Zero until the first probe. */
+  rttMs = 0
+  /** Interarrival jitter of live packets, in milliseconds (RFC 3550-style). */
+  jitterMs = 0
+  /** Mean interval between live packets, in milliseconds. */
+  arrivalMs = 0
 
   private startedAt = 0
   private stoppedAt = 0
+  private lastArrival = 0
+  private arrivals = 0
 
   constructor(private frameSamples: number) {}
 
@@ -60,8 +72,12 @@ export class StreamStats {
       this.firstTimestamp = frame.timestamp
     } else if (this.lastSeq !== null && this.lastTimestamp !== null) {
       const step = seqDistance(this.lastSeq, frame.seq)
+      const catchup = (frame.flags & Flag.Catchup) !== 0
       if (step === 1) {
         // Contiguous, as it should be.
+      } else if (catchup) {
+        // Resume and post-jump refill are allowed to go backwards or
+        // overlap; that is the point of sending history.
       } else if (step === 0) {
         this.duplicates++
       } else if (step < 0x8000) {
@@ -72,7 +88,7 @@ export class StreamStats {
       }
 
       const advance = (frame.timestamp - this.lastTimestamp) >>> 0
-      if (advance !== this.frameSamples) {
+      if (advance !== this.frameSamples && !catchup) {
         this.clockJumps++
       }
     }
@@ -85,6 +101,19 @@ export class StreamStats {
     if (frame.flags & Flag.Catchup) this.catchup++
     if (frame.flags & Flag.Silence) this.silence++
     if (frame.flags & Flag.Discontinuity) this.discontinuity++
+
+    // Catchup is a burst on purpose; jitter is only meaningful on the live edge.
+    if ((frame.flags & Flag.Catchup) === 0) {
+      const now = performance.now()
+      if (this.lastArrival > 0) {
+        const interval = now - this.lastArrival
+        this.arrivals++
+        this.arrivalMs += (interval - this.arrivalMs) / this.arrivals
+        const delta = Math.abs(interval - this.arrivalMs)
+        this.jitterMs += (delta - this.jitterMs) / 16
+      }
+      this.lastArrival = now
+    }
   }
 
   /** Wall clock covered so far, in seconds. */

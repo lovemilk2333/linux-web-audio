@@ -22,8 +22,8 @@ const proxy = {
   '/backend': {
     target: API_TARGET,
     changeOrigin: true,
-    // The page opens a WebSocket on /backend/audio/stream. Without this the
-    // upgrade is refused and every connection falls back to fetch.
+    // The page opens a WebSocket on /backend/audio/stream, and only a
+    // WebSocket. Without this the upgrade is refused and nothing plays.
     ws: true,
   },
 }

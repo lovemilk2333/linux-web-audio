@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-import { FrameParser, ProtocolError, seqDistance, seqNext, type Frame } from './audio/protocol'
+import { FrameParser, ProtocolError, seqNext, type Frame } from './audio/protocol'
 
 /** What GET /audio/info reports. */
 export interface ServerInfo {
@@ -24,6 +24,8 @@ export interface ServerInfo {
   capture_reopens: number
   header_size: number
   timestamp_unit: string
+  /** Exponential moving average of Encode(), in microseconds. */
+  encode_us?: number
 }
 
 export type StreamState = 'idle' | 'connecting' | 'streaming' | 'reconnecting' | 'stopped' | 'failed'
@@ -59,6 +61,11 @@ export interface StreamOptions {
    */
   stallTimeoutMs?: number
   /**
+   * Called just before a reconnect attempt, so the page can drop in-flight
+   * decode timing. Without it, WebCodecs would fold the stall into decodeMs.
+   */
+  onReconnect?: () => void
+  /**
    * The sequence number to resume after, when the caller already knows it.
    *
    * A reader that reconnects internally remembers this itself, but a caller
@@ -66,6 +73,12 @@ export interface StreamOptions {
    * the connection is dropped deliberately — has to hand the point over.
    */
   resumeFrom?: number | null
+  /**
+   * The play-buffer target, in milliseconds. Sent as `buffer_ms` so the
+   * server can prefill that much history at 2× and drop to 0.75× once the
+   * lead reaches it. Omit to join at the live edge with no prefill.
+   */
+  bufferMs?: number
   onFrame: (frame: Frame) => void
   onEvent: (event: StreamEvent) => void
   onState: (state: StreamState) => void
@@ -131,6 +144,8 @@ export interface StreamURLOptions {
    * otherwise sign.
    */
   tokenQuery?: string
+  /** Play-buffer target in milliseconds; omit to join at the live edge. */
+  bufferMs?: number
 }
 
 /**
@@ -149,19 +164,20 @@ export function streamURL(options: StreamURLOptions, websocket: boolean): URL {
   if (options.tokenQuery) {
     url.searchParams.set('token', options.tokenQuery)
   }
+  if (options.bufferMs != null && options.bufferMs > 0) {
+    url.searchParams.set('buffer_ms', String(options.bufferMs))
+  }
   if (websocket) {
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
   }
   return url
 }
 
-/** Reads a header, returning null rather than throwing when it is absent. */
-function headerInt(response: Response, name: string): number | null {
-  const raw = response.headers.get(name)
-  if (raw === null) return null
-  const value = Number.parseInt(raw, 10)
-  return Number.isFinite(value) ? value : null
-}
+/* The HTTP long-connection (chunked GET) path used to live here as a
+ * fallback when the WebSocket handshake failed. The page no longer uses
+ * it: a reverse proxy is allowed to buffer a streaming HTTP response,
+ * which is why the browser is WebSocket-only. `webclient` still speaks
+ * that path. headerInt / readFetch / readOrStall were the reader. */
 
 /** Reads a response body as text for an error message, defensively. */
 async function errorDetail(response: Response): Promise<string> {
@@ -205,9 +221,9 @@ export async function fetchInfo(
  *
  * The resume path is the point of this class. When a connection drops the next
  * one asks for the packet after the last one seen, so the server replays what
- * was missed rather than skipping a hole in the audio. If the server no longer
- * holds that point it answers 416 with the range it does hold, which is
- * reported as a gap rather than silently ignored.
+ * was missed rather than skipping a hole in the audio. If the handshake is
+ * refused — the constructor cannot read a 416 — the next attempt joins at the
+ * live edge instead of looping the same `from_seq`.
  */
 export class StreamReader {
   private controller: AbortController | null = null
@@ -258,6 +274,12 @@ export class StreamReader {
 
         if (!this.running) break
 
+        // Leave streaming immediately: the socket is already gone, and
+        // sitting in that state until the backoff ends would keep playing
+        // (and, with loop-on-underrun, repeating) the last audio.
+        onState('reconnecting')
+        this.options.onReconnect?.()
+
         // First retry quickly — a local stream usually recovers at once — then
         // back off so a server that is genuinely down is not hammered.
         this.attempt++
@@ -280,40 +302,48 @@ export class StreamReader {
   /**
    * Reads one connection to its end.
    *
-   * Tries a WebSocket first: through a reverse proxy, a long-lived HTTP
-   * response is allowed to buffer, and a binary message per packet is not.
-   * A handshake that never completes falls back to fetch for this attempt —
-   * which is how 416 still reports the resume range, because the browser
-   * WebSocket constructor cannot read HTTP headers. Once the socket is
-   * open, a later failure reconnects rather than stacking a second
-   * subscriber. The next reconnect tries WebSocket again.
+   * The page is WebSocket-only. A long-lived HTTP response is allowed to
+   * buffer through a reverse proxy, and a binary message per packet is not.
+   * The HTTP chunked path is still what `webclient` speaks; it is not used
+   * here. A 416 on the handshake lands as a close — the constructor cannot
+   * read those headers — so a resume that the server no longer holds falls
+   * back to the live edge on the same attempt.
    *
    * @returns why it ended, for the caller's log.
    */
   private async readOnce(signal: AbortSignal): Promise<string> {
-    const fromSeq = this.options.resume && this.lastSeq !== null ? seqNext(this.lastSeq) : null
-
-    if (typeof WebSocket !== 'undefined') {
-      try {
-        return await this.readWebSocket(signal, fromSeq)
-      } catch (error) {
-        if (!this.running || signal.aborted) throw error
-        if (!(error instanceof HandshakeError)) throw error
-        // Handshake never completed: 416, 401, an old server, a proxy that
-        // blocks Upgrade. fetch on this attempt can still read those statuses.
-      }
+    if (typeof WebSocket === 'undefined') {
+      throw new StreamError('this browser has no WebSocket')
     }
 
-    return this.readFetch(signal, fromSeq)
+    const fromSeq = this.options.resume && this.lastSeq !== null ? seqNext(this.lastSeq) : null
+
+    try {
+      return await this.readWebSocket(signal, fromSeq)
+    } catch (error) {
+      if (!this.running || signal.aborted) throw error
+      if (!(error instanceof HandshakeError) || fromSeq === null) throw error
+
+      // 416 (resume point gone) is indistinguishable from any other
+      // handshake close. Joining live still plays; staying on a dead
+      // from_seq would loop the same failure.
+      this.lastSeq = null
+      this.options.onEvent({
+        kind: 'gap',
+        message: `resume point ${fromSeq} was refused; joining at the live edge`,
+      })
+      return await this.readWebSocket(signal, null)
+    }
   }
 
   private async readWebSocket(signal: AbortSignal, fromSeq: number | null): Promise<string> {
-    const { baseUrl, codec, token, onFrame, onEvent } = this.options
+    const { baseUrl, codec, token, onFrame, onEvent, bufferMs } = this.options
     const url = streamURL({
       baseUrl,
       codec,
       fromSeq,
       tokenQuery: token || undefined,
+      bufferMs,
     }, true)
 
     let socket: WebSocket
@@ -368,116 +398,15 @@ export class StreamReader {
     }
   }
 
-  private async readFetch(signal: AbortSignal, fromSeq: number | null): Promise<string> {
-    const { baseUrl, codec, token, onFrame, onEvent } = this.options
-
-    const url = streamURL({ baseUrl, codec, fromSeq }, false)
-    const response = await fetch(url, { headers: authHeaders(token), signal })
-
-    if (response.status === 416) {
-      // The requested point has been overwritten by newer audio. The response
-      // carries the range still held, so the page can say how much was missed
-      // instead of just reporting a failure.
-      const oldest = headerInt(response, 'X-Audio-Seq-Oldest')
-      const current = headerInt(response, 'X-Audio-Seq-Current')
-
-      let missing: number | undefined
-      if (this.lastSeq !== null && oldest !== null && current !== null) {
-        // Count forwards from the requested point to what is still available.
-        missing = seqDistance(seqNext(this.lastSeq), oldest)
-      }
-
-      onEvent({
-        kind: 'gap',
-        message:
-          oldest !== null && current !== null
-            ? `resume point ${this.lastSeq} is gone; the server now holds ${oldest}..${current}`
-            : `resume point is gone (${response.status})`,
-        ...(missing !== undefined ? { missing } : {}),
-      })
-
-      // Fall back to the live edge: the alternative is no audio at all.
-      this.lastSeq = null
-      return 'resumed at the live edge after the resume point expired'
-    }
-
-    if (response.status === 401) {
-      const detail = await errorDetail(response)
-      throw new StreamError(
-        `the server requires a token${detail ? `: ${detail}` : ''}`,
-        response.status,
-      )
-    }
-
-    if (!response.ok) {
-      const detail = await errorDetail(response)
-      throw new StreamError(
-        `GET /audio/stream returned ${response.status}${detail ? `: ${detail}` : ''}`,
-        response.status,
-      )
-    }
-
-    if (!response.body) {
-      throw new StreamError('the response has no body to stream')
-    }
-
-    const resumed = fromSeq !== null
-    onEvent({
-      kind: 'open',
-      message: resumed && this.lastSeq !== null
-        ? `resumed at seq ${seqNext(this.lastSeq)}`
-        : 'connected at the live edge',
-    })
-    this.options.onState('streaming')
-
-    const parser = new FrameParser()
-    const reader = response.body.getReader()
-
-    const stallTimeout = this.options.stallTimeoutMs ?? 3000
-
-    try {
-      for (;;) {
-        const { value, done } = await readOrStall(reader, stallTimeout)
-        if (done) return 'the server closed the stream'
-
-        let frames: Frame[]
-        try {
-          frames = parser.push(value)
-        } catch (error) {
-          if (error instanceof ProtocolError) {
-            // Framing is broken, so the rest of this connection cannot be
-            // trusted. Reconnecting resynchronises from a fresh response.
-            throw new StreamError(`framing error: ${error.message}`)
-          }
-          throw error
-        }
-
-        for (const frame of frames) {
-          this.lastSeq = frame.seq
-          onFrame(frame)
-        }
-      }
-    } finally {
-      // Cancelling releases the connection immediately rather than waiting for
-      // the server to notice, which matters for a prompt reconnect.
-      await reader.cancel().catch(() => undefined)
-    }
-  }
+  // The HTTP long-connection reader used to live here as `readFetch`.
+  // Kept out of the page: see the note above streamURL.
 }
 
-/**
- * Reads a chunk, giving up if nothing arrives for `timeoutMs`.
- *
- * A dropped connection that closes cleanly is noticed immediately, but one
- * that goes half-open — a sleeping laptop, a dead router — leaves read()
- * pending until TCP times out. The stream is never quiet for long, so silence
- * is a reliable signal.
- */
 /**
  * Resolves when the socket opens, or rejects if it closes first.
  *
  * A 416 / 401 on the handshake lands here as a close: the constructor cannot
- * read those headers, so the caller falls back to fetch.
+ * read those headers. A refused resume then retries at the live edge.
  */
 function waitForOpen(socket: WebSocket, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -586,25 +515,6 @@ function nextMessage(
     signal.addEventListener('abort', onAbort, { once: true })
     if (signal.aborted) onAbort()
   })
-}
-
-function readOrStall(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  timeoutMs: number,
-): Promise<ReadableStreamReadResult<Uint8Array>> {
-  const pending = reader.read()
-  // The timeout may win the race, leaving this rejection unobserved.
-  pending.catch(() => undefined)
-
-  let timer: ReturnType<typeof setTimeout> | undefined
-  const stalled = new Promise<never>((_, reject) => {
-    timer = setTimeout(
-      () => reject(new StreamError(`nothing arrived for ${timeoutMs} ms, treating the stream as dead`)),
-      timeoutMs,
-    )
-  })
-
-  return Promise.race([pending, stalled]).finally(() => clearTimeout(timer))
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {

@@ -13,16 +13,46 @@
  *   - Playback waits for the target to accumulate. Starting on the first packet
  *     leaves no margin against a real-time source, so the buffer hovers at zero
  *     and every late packet is heard as a hole.
- *   - A buffer that still runs dry is filled with silence rather than stalling,
- *     and the underrun is counted. The audio clock cannot wait for the network.
- *   - A buffer that grows makes latency grow with it. Past a high water mark
- *     the oldest audio is discarded, which trades a click for bounded delay.
+ *   - Playback runs at 1× and only ever at 1×. Tracking the target by
+ *     resampling — reading a little slow when short and a little fast when
+ *     long — is a pitch change, and on a 20 ms buffer the level moves enough
+ *     for that to be heard as a warble. The distance to the target is paid off
+ *     in whole samples instead, a repeat or a skip every few thousand, which
+ *     leaves the pitch alone and still lets a drained buffer refill.
+ *   - A buffer that still runs dry is filled with silence (or, opt-in, a short
+ *     loop of what just played) and playback continues. Stopping to rebuild
+ *     turns a 3 ms hole into a whole target of silence.
  *
  * This must stay a plain, unbundled file: the browser loads it with
  * audioWorklet.addModule(url), not as part of a bundle.
  */
 
 const DEFAULT_CHANNELS = 2
+
+/**
+ * How much of the distance to the target is added to the debt each block.
+ *
+ * Tuned so the clock drift this machine measures — about 32 frames a second
+ * between the capture source and the audio device — is held at roughly 92% of
+ * the target, without the loop reacting hard enough to the level's ordinary
+ * packet-rate swing to flutter.
+ */
+const CORRECTION_GAIN = 0.008
+
+/** Extra weight while recovering from a real drain. See owe(). */
+const RECOVERY_MULTIPLIER = 4
+
+/** Most single-sample corrections to spend in one render block (~3%). */
+const MAX_CORRECTIONS_PER_BLOCK = 4
+
+/**
+ * Ceiling on the debt, in samples.
+ *
+ * Without it a long stall would leave corrections owed for minutes after the
+ * buffer had already recovered, and the reader would keep repeating a sample
+ * long past the point of it being the right thing to do.
+ */
+const MAX_OWED = 64
 
 class PlayerProcessor extends AudioWorkletProcessor {
   constructor(options) {
@@ -45,52 +75,21 @@ class PlayerProcessor extends AudioWorkletProcessor {
     this.playing = false
 
     /**
-     * Frames owed to the drift corrector, fractional.
+     * Samples the reader owes the target, fractional.
      *
-     * Negative means the buffer is short and the reader should repeat a frame;
-     * positive means it is long and one should be skipped. See the correction
-     * at the chunk boundary in process().
+     * Negative means the buffer is short and the reader owes itself repeats;
+     * positive means it is long and owes skips. Integrated from the distance to
+     * the target every block — see owe() — and paid one whole sample at a time.
      */
     this.correction = 0
 
     /**
      * How often playback had to stop and rebuild the buffer.
      *
-     * Not an error, but worth counting: a rising number means the stream is
-     * arriving slower than it plays, which is the one condition this cannot
-     * recover from on its own.
+     * Kept for the status panel. The reader no longer rebuilds, so this stays
+     * at zero.
      */
     this.refills = 0
-
-    /**
-     * Audio-thread time when the buffer last sat below the reserve floor, or
-     * 0 if it is currently above it.
-     *
-     * The early-refill safety net waits for this to stay set for a few tens of
-     * milliseconds before stopping playback: a single block below the floor is
-     * ordinary burst jitter, not a drain.
-     */
-    this.lowSince = 0
-
-    /**
-     * Audio-thread time of the most recent refill, early or underrun-driven.
-     *
-     * A cooldown after a rebuild stops a healthy bursty stream from re-arming
-     * every few hundred milliseconds — which is what a plain level threshold
-     * did, and why that approach was abandoned.
-     */
-    this.lastRefillAt = 0
-
-    /**
-     * One sample waiting to be written at the start of the next block.
-     *
-     * Repeating a frame needs a free slot in the current output. When a chunk
-     * boundary lands exactly on the end of a render quantum there is none, and
-     * without this the owed repeat is deferred until some later boundary that
-     * happens to fall mid-block — which systematically under-repeats and is
-     * why a 20 ms target still dipped to a few milliseconds.
-     */
-    this.pendingRepeat = null
 
     /**
      * True while there is no stream to play.
@@ -126,6 +125,23 @@ class PlayerProcessor extends AudioWorkletProcessor {
     this.silent = true
     this.clipped = 0
     this.quantaSinceReport = 0
+    this.loops = 0
+
+    /**
+     * When true, a drained buffer is filled from a short ring of what just
+     * played instead of silence. Off by default: it hides a stall as a
+     * stutter rather than a click. Only used after playback has started;
+     * preroll waits in silence even when this is on.
+     */
+    this.loopOnUnderrun = opts.loopOnUnderrun === true
+    /** About 40 ms of recently played audio, one plane per channel. */
+    this.loopHold = Math.max(128, Math.round(this.sampleRate * 0.04))
+    this.loopRing = Array.from({ length: this.channels }, () => new Float32Array(this.loopHold))
+    this.loopWrite = 0
+    this.loopFilled = 0
+    this.loopRead = 0
+    /** True while the current dry spell is being filled from the ring. */
+    this.looping = false
 
     this.port.onmessage = (event) => this.receive(event.data)
     this.port.postMessage({ type: 'ready', sampleRate: this.sampleRate, channels: this.channels })
@@ -151,6 +167,20 @@ class PlayerProcessor extends AudioWorkletProcessor {
       case 'idle':
         this.idle = message.idle === true
         break
+      case 'loop':
+        this.loopOnUnderrun = message.enabled === true
+        break
+      case 'flush':
+        // Drop leftover audio without touching the counters. A reconnect
+        // should wait for a fresh target, not splice the last session onto
+        // the prefill.
+        this.queue = []
+        this.offset = 0
+        this.buffered = 0
+        this.playing = false
+        this.looping = false
+        this.correction = 0
+        break
       case 'reset':
         this.queue = []
         this.offset = 0
@@ -160,10 +190,13 @@ class PlayerProcessor extends AudioWorkletProcessor {
         this.playedFrames = 0
         this.clipped = 0
         this.refills = 0
-        this.lowSince = 0
-        this.lastRefillAt = 0
-        this.pendingRepeat = null
+        this.correction = 0
         this.playing = false
+        this.loops = 0
+        this.loopWrite = 0
+        this.loopFilled = 0
+        this.loopRead = 0
+        this.looping = false
         break
       default:
         break
@@ -171,26 +204,15 @@ class PlayerProcessor extends AudioWorkletProcessor {
   }
 
   /**
-   * Changes how much audio to hold, in whichever direction that means.
+   * Changes how much audio to hold.
    *
-   * A live source arrives at exactly playback speed, so a buffer below its
-   * target never fills on its own: the level is whatever it was. Raising the
-   * target therefore has to pause playback until it fills, and lowering it has
-   * to discard the difference. Anything else makes the control do nothing in
-   * one direction, which is what it did before.
+   * The setpoint the debt is measured against. Lowering it discards the extra
+   * so latency actually falls; raising it leaves the reader owing repeats,
+   * which bring the level up without stopping playback.
    */
   setTarget(targetMs) {
     this.targetMs = targetMs
-
-    if (this.buffered > this.targetFrames) {
-      this.trimTo(this.targetFrames)
-      this.playing = true
-      return
-    }
-
-    // Below the target: stop playing so the buffer can build. Nothing is
-    // dropped, so this costs the difference in delay, once.
-    this.playing = false
+    if (this.buffered > this.targetFrames) this.trimTo(this.targetFrames)
   }
 
   /** Frames left in the head chunk that have not been played yet. */
@@ -249,80 +271,54 @@ class PlayerProcessor extends AudioWorkletProcessor {
     this.trimTo(this.targetFrames)
   }
 
-  process(_inputs, outputs) {
-    const output = outputs[0]
-    if (!output || output.length === 0) return true
-
-    const wanted = output[0].length
-    let written = 0
-    let peak = 0
-
-    /* Drift correction.
-     *
-     * The audio device and the capture source are separate clocks, both
-     * nominally 48 kHz and actually a few tens of ppm apart. Measured here:
-     * 47999.4 frames arrive per second while 48031.4 are played, so the buffer
-     * drains a packet every fifteen seconds for as long as the page is open.
-     * Queueing cannot fix it — the two sides disagree about how long a second
-     * is — so the reader is nudged instead: short buffer, repeat one frame;
-     * long buffer, skip one.
-     *
-     * Spread over a hundred chunk boundaries a second, a single repeated or
-     * skipped frame is inaudible. The alternative is a 20 ms dropout every
-     * fifteen seconds, which is not.
-     *
-     * The gain has to be high enough that the steady-state error stays small.
-     * At 0.001 the integrator could only sustain the measured ~32 repeated
-     * frames/s by sitting at |errorRatio| ≈ 0.67 — one third of the target —
-     * so a 100 ms buffer meant ~33 ms and still sawtoothed into underruns.
-     * 0.008 puts the same drift at |errorRatio| ≈ 0.08, about 92% of target,
-     * which matters most for thin buffers: a 20 ms target with the weaker
-     * 0.004 gain still dipped to a few milliseconds and clicked.
-     *
-     * Below three quarters of the target the shortfall is counted twice, so
-     * the reader spends its one-frame-per-boundary budget recovering reserve
-     * instead of hovering near empty. That band never stops playback; it only
-     * shapes the corrector. */
+  /**
+   * Adds this block's distance to the target to the debt.
+   *
+   * The error is integrated rather than acted on directly, because the level
+   * is not smooth: packets arrive in bursts while playback drains
+   * continuously, so a 20 ms buffer swings several milliseconds with every
+   * one of them. Reacting to that swing is what a warble is. Only its average
+   * should move the reader.
+   *
+   * Below the shortfall line the weight goes up, so a buffer that actually
+   * drained refills in a fraction of a second instead of crawling back. That
+   * line is four render blocks under the target, kept within three quarters of
+   * it (which is the same line for any sane target — at 100 ms it is exactly
+   * the old rule) and above a quarter of it, so a target thinner than four
+   * blocks still has a recovery band. At the 20 ms default the line lands
+   * about 9 ms, under the ordinary packet swing, so ordinary jitter never
+   * reaches it.
+   */
+  owe(blockFrames) {
     const target = Math.max(1, this.targetFrames)
-    const ratio = this.buffered / target
-    const errorRatio = ratio >= 0.75 ? ratio - 1 : (ratio - 1) * 2
-    this.correction = Math.max(-4, Math.min(4, this.correction + errorRatio * wanted * 0.008))
+    const shortfall = Math.max(target * 0.25, Math.min(target * 0.75, target - blockFrames * 4))
+    const gain = this.buffered < shortfall ? CORRECTION_GAIN * RECOVERY_MULTIPLIER : CORRECTION_GAIN
+    const owed = ((this.buffered - target) / target) * blockFrames * gain
+    this.correction = Math.max(-MAX_OWED, Math.min(MAX_OWED, this.correction + owed))
+  }
 
-    if (this.idle && this.buffered === 0) {
-      for (let channel = 0; channel < output.length; channel++) output[channel].fill(0)
-      this.playing = false
-      this.pendingRepeat = null
-      this.report(wanted)
-      return true
+  /** Fills a stretch of every channel with silence. */
+  silence(output, from, count) {
+    for (let channel = 0; channel < output.length; channel++) {
+      output[channel].fill(0, from, from + count)
     }
+  }
 
-    if (!this.playing) {
-      if (this.buffered < this.targetFrames) {
-        // Still filling. Output silence, but do not count it as a dropout:
-        // nothing has been dropped and nothing is late.
-        for (let channel = 0; channel < output.length; channel++) output[channel].fill(0)
-        this.pendingRepeat = null
-        this.report(wanted)
-        return true
-      }
-      this.playing = true
-    }
-
-    if (this.pendingRepeat && written < wanted) {
-      for (let channel = 0; channel < output.length; channel++) {
-        output[channel][written] = this.pendingRepeat[Math.min(channel, this.pendingRepeat.length - 1)]
-      }
-      written += 1
-      this.correction = Math.min(4, this.correction + 1)
-      this.pendingRepeat = null
-    }
-
-    while (written < wanted && this.queue.length > 0) {
+  /**
+   * Copies up to `count` samples from the head of the queue at 1×.
+   *
+   * No rate, no interpolation: what was encoded is what comes out, which is
+   * what keeps the pitch where it belongs.
+   *
+   * @returns how many samples were written. Short of `count` means the queue
+   * ran out.
+   */
+  copyOut(output, from, count, unity) {
+    let copied = 0
+    while (copied < count && this.queue.length > 0) {
       const head = this.queue[0]
       const available = head[0].length - this.offset
-      const take = Math.min(available, wanted - written)
-
-      const unity = this.gain === 1
+      const take = Math.min(available, count - copied)
 
       for (let channel = 0; channel < output.length; channel++) {
         // Mono into a stereo output duplicates rather than leaving a silent
@@ -331,7 +327,7 @@ class PlayerProcessor extends AudioWorkletProcessor {
         const destination = output[channel]
 
         if (unity) {
-          destination.set(source.subarray(this.offset, this.offset + take), written)
+          destination.set(source.subarray(this.offset, this.offset + take), from + copied)
           continue
         }
 
@@ -347,107 +343,141 @@ class PlayerProcessor extends AudioWorkletProcessor {
             sample = -1
             this.clipped++
           }
-          destination[written + i] = sample
+          destination[from + copied + i] = sample
         }
-      }
-
-      // Metered from channel 0 of the output, which is post-gain and post-clamp
-      // — exactly what reaches the speakers.
-      for (let i = 0; i < take; i++) {
-        const sample = Math.abs(output[0][written + i])
-        if (sample > peak) peak = sample
       }
 
       this.offset += take
       this.buffered -= take
-      written += take
-      this.playedFrames += take
+      copied += take
 
       if (this.offset >= head[0].length) {
         this.queue.shift()
         this.offset = 0
-
-        /* At most one frame of correction per boundary, which bounds the
-         * artefact rate no matter how wrong the level is. A owed repeat that
-         * finds the block already full is deferred to the next block rather
-         * than dropped — otherwise boundaries that land on a quantum edge
-         * silently refuse to correct. */
-        if (this.correction >= 1 && this.queue.length > 0 && this.queue[0][0].length > 1) {
-          this.offset = 1
-          this.buffered -= 1
-          this.correction -= 1
-        } else if (this.correction <= -1 && written > 0) {
-          if (written < wanted) {
-            for (let channel = 0; channel < output.length; channel++) {
-              output[channel][written] = output[channel][written - 1]
-            }
-            written += 1
-            this.correction += 1
-          } else if (!this.pendingRepeat) {
-            this.pendingRepeat = []
-            for (let channel = 0; channel < output.length; channel++) {
-              this.pendingRepeat.push(output[channel][written - 1])
-            }
-          }
-        }
       }
+    }
+
+    if (this.buffered < 0) this.buffered = 0
+    return copied
+  }
+
+  /** Drops one source sample without outputting it. */
+  skipOne() {
+    if (this.queue.length === 0) return
+    const head = this.queue[0]
+    this.offset++
+    this.buffered--
+    if (this.offset >= head[0].length) {
+      this.queue.shift()
+      this.offset = 0
+    }
+  }
+
+  process(_inputs, outputs) {
+    const output = outputs[0]
+    if (!output || output.length === 0) return true
+
+    const wanted = output[0].length
+
+    if (this.idle) {
+      // Silence, even if something is still queued. Reconnect flushes first;
+      // looping leftover audio here is the stutter that option is not for.
+      this.silence(output, 0, wanted)
+      this.playing = false
+      this.looping = false
+      this.correction = 0
+      this.report(wanted)
+      return true
+    }
+
+    if (!this.playing) {
+      if (this.buffered < this.targetFrames) {
+        // Preroll. Silence even when looping is on: the ring is the last
+        // session's audio, and repeating it before anything new has arrived
+        // is the reconnect bug.
+        this.silence(output, 0, wanted)
+        this.correction = 0
+        this.report(wanted)
+        return true
+      }
+      this.playing = true
+    }
+
+    this.owe(wanted)
+
+    const skipping = this.correction > 0
+    let budget = Math.min(MAX_CORRECTIONS_PER_BLOCK, Math.floor(Math.abs(this.correction)))
+    let untilDue = budget > 0 ? Math.max(1, Math.floor(wanted / (budget + 1))) : 0
+
+    let written = 0
+    let peak = 0
+    const unity = this.gain === 1
+
+    while (written < wanted) {
+      const limit = budget > 0 ? Math.min(untilDue, wanted - written) : wanted - written
+      const copied = this.copyOut(output, written, limit, unity)
+      if (copied === 0) break
+
+      // Metered from channel 0 of the output, which is post-gain and
+      // post-clamp — exactly what reaches the speakers.
+      for (let i = written; i < written + copied; i++) {
+        const sample = Math.abs(output[0][i])
+        if (sample > peak) peak = sample
+      }
+      written += copied
+
+      if (budget === 0) continue
+
+      untilDue -= copied
+      if (untilDue > 0) continue
+
+      /* One whole sample of the debt, spread evenly through the block rather
+       * than taken at a chunk boundary. A boundary only comes round every
+       * packet, and at a 5 ms frame that is too seldom to refill a 20 ms
+       * buffer in reasonable time. */
+      if (skipping) {
+        this.skipOne()
+        budget--
+        this.correction -= 1
+      } else if (written < wanted) {
+        // Repeating a sample stretches the waveform by one sample. It is a
+        // far smaller artefact than a rate change, and it is what buys the
+        // buffer time to refill.
+        for (let channel = 0; channel < output.length; channel++) {
+          output[channel][written] = output[channel][written - 1]
+        }
+        written++
+        budget--
+        this.correction += 1
+      }
+
+      untilDue = budget > 0 ? Math.max(1, Math.floor((wanted - written) / (budget + 1))) : 0
+    }
+
+    if (written > 0) {
+      this.captureLoop(output, 0, written)
+      this.looping = false
     }
 
     if (written < wanted) {
-      // The buffer ran dry mid-block. Play silence for the rest instead of
-      // repeating or stalling, and count it.
-      for (let channel = 0; channel < output.length; channel++) {
-        output[channel].fill(0, written)
+      // The buffer ran dry mid-block. Loop a short stretch of what just
+      // played when that is enabled and we have any; otherwise silence.
+      const remaining = wanted - written
+      if (this.loopOnUnderrun && this.loopFilled > 0) {
+        this.fillFromLoop(output, written, remaining)
+      } else {
+        this.silence(output, written, remaining)
       }
 
-      if (written === 0) {
-        this.underruns++
+      if (written === 0) this.underruns++
 
-        /* The buffer reached nothing, so stop and rebuild it.
-         *
-         * A live source arrives at exactly playback speed, which means a
-         * buffer that has drained can never refill while playing: it stays at
-         * zero for the rest of the session and every later packet is late
-         * against an output that is already starving. One bad moment would
-         * otherwise ratchet the level down permanently.
-         *
-         * Keyed to an actual dropout rather than to a level. A threshold was
-         * the obvious approach and it does not work: packets arrive in bursts
-         * while playback drains continuously, so the level swings several
-         * milliseconds below the target as a matter of course, and any
-         * threshold high enough to catch a drain also catches ordinary jitter.
-         * Measured, a guessed threshold re-armed playback every 220 ms on a
-         * healthy stream. A dropout is a fact; a level is a guess. */
-        this.playing = false
-        this.refills++
-        this.lastRefillAt = currentTime
-        this.lowSince = 0
-      }
-    }
-
-    /* Early refill safety net.
-     *
-     * The corrector is what holds the level; this only fires when the buffer
-     * has already fallen to about one render quantum (~4 ms) and stayed there
-     * for tens of milliseconds. That is far below ordinary burst depth on any
-     * sane target, so it does not revive the ~220 ms thrashing of a level
-     * threshold near the setpoint. A one-second cooldown after any refill is
-     * the other half of that defence. */
-    const reserveFloor = Math.max(wanted, Math.round(this.sampleRate * 0.004))
-    if (this.playing && this.buffered > 0 && this.buffered < reserveFloor) {
-      if (this.lowSince === 0) {
-        this.lowSince = currentTime
-      } else if (
-        currentTime - this.lowSince >= 0.05 &&
-        currentTime - this.lastRefillAt >= 1.0
-      ) {
-        this.playing = false
-        this.refills++
-        this.lastRefillAt = currentTime
-        this.lowSince = 0
-      }
-    } else {
-      this.lowSince = 0
+      /* Stay playing.
+       *
+       * A live source arrives at 1×, so a buffer that has drained can never
+       * refill by waiting — but it does not have to wait. The debt is already
+       * at its ceiling, and the repeats it pays out are what hold playback
+       * back until the buffer has climbed again. Stopping to rebuild would
+       * turn this hole into a whole target of silence. */
     }
 
     this.peak = Math.max(this.peak, peak)
@@ -485,6 +515,7 @@ class PlayerProcessor extends AudioWorkletProcessor {
       enqueuedFrames: this.enqueuedFrames,
       contextRate: sampleRate,
       streamRate: this.sampleRate,
+      loops: this.loops,
     })
 
     /* Both reset each report, so they describe the last window rather than
@@ -493,6 +524,49 @@ class PlayerProcessor extends AudioWorkletProcessor {
      * useful question is whether it is clipping *now*. */
     this.peak = 0
     this.clipped = 0
+  }
+
+  /** Fills a dry stretch from the ring, restarting only on a new dry spell. */
+  fillFromLoop(output, from, count) {
+    if (!this.looping) {
+      this.loopRead = 0
+      this.looping = true
+    }
+    this.writeLoop(output, from, count)
+    this.loops++
+  }
+
+  /** Copies recently played samples into the underrun ring. */
+  captureLoop(output, from, count) {
+    if (count <= 0) return
+    for (let i = 0; i < count; i++) {
+      const at = (this.loopWrite + i) % this.loopHold
+      for (let channel = 0; channel < this.loopRing.length; channel++) {
+        const source = output[Math.min(channel, output.length - 1)]
+        this.loopRing[channel][at] = source[from + i]
+      }
+    }
+    this.loopWrite = (this.loopWrite + count) % this.loopHold
+    this.loopFilled = Math.min(this.loopHold, this.loopFilled + count)
+  }
+
+  /** Fills `count` samples from the ring, wrapping, starting at `from`. */
+  writeLoop(output, from, count) {
+    const hold = this.loopFilled
+    if (hold <= 0) {
+      this.silence(output, from, count)
+      return
+    }
+    // Oldest sample is loopWrite - hold. loopRead is an offset into that window.
+    const origin = (this.loopWrite - hold + this.loopHold) % this.loopHold
+    for (let i = 0; i < count; i++) {
+      const src = (origin + ((this.loopRead + i) % hold)) % this.loopHold
+      for (let channel = 0; channel < output.length; channel++) {
+        const ring = this.loopRing[Math.min(channel, this.loopRing.length - 1)]
+        output[channel][from + i] = ring[src]
+      }
+    }
+    this.loopRead = (this.loopRead + count) % hold
   }
 }
 
