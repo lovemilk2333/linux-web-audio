@@ -90,40 +90,35 @@ range is silence rather than −60 dB, positive gain clamps at full scale rather
 than wrapping, and the meter grows a `clip` badge while that is happening — per
 report window, so it clears again instead of latching on the first loud moment.
 
-**Playback is 1×, and the level is paid off in whole samples.** The audio
-device and the capture source are separate clocks, both nominally 48 kHz and
-actually a few tens of ppm apart, and a live source arrives at exactly playback
-speed — so a drained buffer cannot refill by waiting, and stopping to rebuild
-turns a 3 ms hole into a whole target of silence.
+**The reader steers with a rate a whisker off 1×, never with a step.** The audio
+device and the capture source are separate clocks — measured against this
+machine's HDMI output, 695 ppm apart — and something has to absorb the
+difference. Whole-sample repeats and skips were the first attempt, and they are
+gone: one sample duplicated every thirty milliseconds is a rasp, and it was
+plainly audible as one. What absorbs the difference now is a resampling ratio a
+few hundred ppm from unity, which is a couple of cents of pitch and continuous
+by construction. Measured in the browser against the same drift: the rate sits
+within ±0.001 of 1×, the mean offset is 92 ppm — a sixth of a cent — and the
+level holds 19–21 ms at a 20 ms target with nothing discarded.
 
-Tracking the target by *resampling* — reading slightly slow when short, slightly
-fast when long — is the textbook answer and it is wrong here: a rate change is a
-pitch change, and on a 20 ms buffer the level swings several milliseconds with
-every packet, so the reader ends up warbling continuously. The distance to the
-target is integrated into a debt instead, and the debt is paid one whole sample
-at a time: a repeated sample when the buffer is short, a skipped one when it is
-long. Spread through the block at up to four samples per 128, that is ~3% of
-playback held back at the very most, and it leaves the pitch exactly where it
-was.
-
-**The reader steers on a filtered level, and the filter is not cosmetic.** Five
+**The level is measured at the arrivals, not filtered through them.** Five
 milliseconds of audio lands at once and drains continuously, so the queue is a
-sawtooth; a controller fed that sawtooth reacts to it instead of to the level,
-which is what forces its gain — and therefore its residual — down. Averaging
-over about two packets leaves the mean, which is the thing worth holding, and
-then the gain can be high enough that the residual is under a millisecond at
-either 20 ms or 100 ms. That matters most for a thin buffer: the *relative*
-residual of an integral loop is proportional to the target, so a gain tuned at
-100 ms left a 20 ms buffer sitting at 78% of it — the level the user asked for
-by name, minus a quarter. Measured at the current gain, a 20 ms target holds
-20.0 ms at rest and 19.8 ms against the measured clock drift.
+sawtooth by a whole packet. Feeding that to the rate is what makes a resampling
+reader warble — the first version of this rippled the rate by 0.3%, which is
+audible. Filtering the sawtooth only attenuates it. Instead the level is
+sampled the moment a packet lands, which is the one instant its phase is known:
+the queue is at its peak, exactly half a packet above the level it is draining
+around, so half a packet is subtracted and what is left is the mean. A light
+filter on top (a quarter per packet) handles the arrival jitter, and the rate
+itself is smoothed over 80 ms so that even the residual moves the speed by a
+fraction of itself per block.
 
-The debt is capped, which is what bounds both the overshoot after a recovery
-and the wind-up after a stall. `correction` in `window.__webaudio.player` is
-that debt, in samples; the panel's buffer figure is the filtered level, so the
-number does not jump with every packet. `enqueuedFrames` against `playedFrames`
-is still how a clock mismatch is told apart from a stream that is simply
-arriving slowly.
+The rate is capped at ±3%, which is what bounds a recovery in both time and
+pitch: a buffer that has drained refills by playing slow, and the cap is what
+stops that from becoming a slur. The panel shows the rate, and the health list
+grows a row when it leaves unity by more than 0.5%. `playedFrames` against
+`enqueuedFrames` is still how a clock mismatch is told apart from a stream that
+is simply arriving slowly.
 
 **The buffer is a real jitter buffer.** Playback waits until the target has
 accumulated, then plays continuously. Starting on the very first packet
@@ -155,6 +150,7 @@ client can only know by checking:
 | replayed | packets served from the server's history after a resume |
 | gaps flagged | the server itself reported a discontinuity |
 | refills | playback stopped to rebuild a buffer that had drained |
+| resampling | the rate left unity by more than 0.5% — the pitch cost of a buffer that drained |
 | looped | underrun blocks filled by repeating recent audio |
 | stability | live-packet interarrival jitter; *steady* under 3 ms |
 | gain | the playback gain in force, when it is not unity |

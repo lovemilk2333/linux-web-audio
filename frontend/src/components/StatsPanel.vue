@@ -107,6 +107,15 @@ const latency = computed(() => {
       value: formatMs(jitter),
       hint: 'RFC 3550-style interarrival jitter of live packets',
     },
+    {
+      // A whisker either side of 1.00000: the capture and the audio device are
+      // separate clocks, and this is where the difference between them goes.
+      // A few hundred ppm is a couple of cents of pitch and is inaudible; a
+      // reading near 1.03 or 0.97 means a buffer that drained is refilling.
+      label: 'playback rate',
+      value: `${player.rate.toFixed(5)}×`,
+      hint: 'how fast the reader is consuming the stream',
+    },
   ]
 })
 
@@ -204,6 +213,17 @@ const health = computed(() => {
       label: 'looped',
       value: `${props.player.loops} blocks`,
       tone: 'ok',
+    })
+  }
+
+  // Only worth a row when it is doing something: a rate at the cap means the
+  // buffer is being refilled, and that is audible as pitch.
+  const rate = Math.abs(props.player.rate - 1)
+  if (rate > 0.005) {
+    items.push({
+      label: 'resampling',
+      value: `${props.player.rate.toFixed(3)}× (${Math.round(rate * 1e6)} ppm)`,
+      tone: rate > 0.02 ? 'bad' : 'warn',
     })
   }
 

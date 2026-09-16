@@ -44,11 +44,13 @@ export interface PlayerStatus {
   contextRate: number
   streamRate: number
   /**
-   * Samples the reader owes the target: negative is short and being paid in
-   * repeated samples, positive is long and being paid in skipped ones. Near
-   * zero when the level is where it should be.
+   * How fast the reader is consuming the stream, as a fraction of realtime.
+   *
+   * A whisker either side of 1: it is how the two clocks' difference is
+   * absorbed, and what it costs is pitch — a few hundred ppm is a couple of
+   * cents, which is nothing. Only a stalled buffer pushes it to the cap.
    */
-  correction: number
+  rate: number
   /** Times a drained buffer was filled by looping recent audio. */
   loops: number
 }
@@ -70,7 +72,7 @@ const IDLE_STATUS: PlayerStatus = {
   playedFrames: 0,
   contextRate: 0,
   streamRate: 0,
-  correction: 0,
+  rate: 1,
   loops: 0,
 }
 
@@ -183,7 +185,7 @@ export class Player {
         playedFrames: message.playedFrames ?? 0,
         contextRate: message.contextRate ?? 0,
         streamRate: message.streamRate ?? 0,
-        correction: message.correction ?? 0,
+        rate: message.rate ?? 1,
         loops: message.loops ?? 0,
       }
       for (const listener of this.listeners) listener(this.status)

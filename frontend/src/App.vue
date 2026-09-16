@@ -133,7 +133,7 @@ const playerStatus = reactive<PlayerStatus>({
   playedFrames: 0,
   contextRate: 0,
   streamRate: 0,
-  correction: 0,
+  rate: 1,
   loops: 0,
 })
 

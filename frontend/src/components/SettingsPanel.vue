@@ -37,10 +37,12 @@ const emit = defineEmits<{
         <p class="hint">
           How much audio to hold before playing starts. This is also the delay you hear: the buffer
           cannot fill faster than the source produces it, so a live stream always lags by roughly
-          this much. The worklet steers back to this level by repeating or skipping single
-          samples, never by changing speed, so a hole is filled without stopping to rebuild and
-          without the pitch moving. More absorbs stalls; less gets you closer to live. Past twice
-          this, the oldest audio is discarded to keep the delay from growing.
+          this much. The worklet steers back to this level by playing a whisker off 1× — a few
+          hundred ppm, which is a sixth of a cent of pitch and nothing anyone can hear — so a hole
+          is filled without stopping to rebuild. Raising this while playing stops playback briefly
+          and lets the buffer build at the source's own rate. More absorbs stalls; less gets you
+          closer to live. Past twice this, the oldest audio is discarded to keep the delay from
+          growing.
         </p>
         <p class="hint detail">
           The step is one frame and the floor is {{ minTargetMs }} ms here, which is the default:
