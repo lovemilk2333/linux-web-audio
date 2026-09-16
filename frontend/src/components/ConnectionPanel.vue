@@ -1,6 +1,6 @@
 <!-- SPDX-License-Identifier: BSD-3-Clause -->
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onBeforeUnmount, onMounted } from 'vue'
 
 import LevelMeter from './LevelMeter.vue'
 import type { ServerInfo, StreamState } from '../stream'
@@ -78,6 +78,23 @@ const warning = computed(() => {
   }
   return null
 })
+
+const handleKeydown = (event: KeyboardEvent) => {
+  if (event.key === 'Enter' || event.key === ' ') {
+    event.preventDefault()
+    connected.value ? emit('disconnect') : emit('connect')
+
+  }
+}
+
+onMounted(() => {
+  window.addEventListener('keydown', handleKeydown)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', handleKeydown)
+})
+
 </script>
 
 <template>
