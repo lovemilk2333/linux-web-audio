@@ -106,15 +106,24 @@ long. Spread through the block at up to four samples per 128, that is ~3% of
 playback held back at the very most, and it leaves the pitch exactly where it
 was.
 
-Below four render blocks under the target — about 9 ms at the 20 ms default,
-and never reached by ordinary packet jitter — the debt is accumulated four
-times faster, so a buffer that genuinely drained refills in a fraction of a
-second rather than crawling back. The debt is capped, so a long stall cannot
-leave corrections owed for minutes.
+**The reader steers on a filtered level, and the filter is not cosmetic.** Five
+milliseconds of audio lands at once and drains continuously, so the queue is a
+sawtooth; a controller fed that sawtooth reacts to it instead of to the level,
+which is what forces its gain — and therefore its residual — down. Averaging
+over about two packets leaves the mean, which is the thing worth holding, and
+then the gain can be high enough that the residual is under a millisecond at
+either 20 ms or 100 ms. That matters most for a thin buffer: the *relative*
+residual of an integral loop is proportional to the target, so a gain tuned at
+100 ms left a 20 ms buffer sitting at 78% of it — the level the user asked for
+by name, minus a quarter. Measured at the current gain, a 20 ms target holds
+20.0 ms at rest and 19.8 ms against the measured clock drift.
 
-The `correction` value in `window.__webaudio.player` is that debt, in samples.
-`enqueuedFrames` against `playedFrames` is still how a clock mismatch is told
-apart from a stream that is simply arriving slowly.
+The debt is capped, which is what bounds both the overshoot after a recovery
+and the wind-up after a stall. `correction` in `window.__webaudio.player` is
+that debt, in samples; the panel's buffer figure is the filtered level, so the
+number does not jump with every packet. `enqueuedFrames` against `playedFrames`
+is still how a clock mismatch is told apart from a stream that is simply
+arriving slowly.
 
 **The buffer is a real jitter buffer.** Playback waits until the target has
 accumulated, then plays continuously. Starting on the very first packet

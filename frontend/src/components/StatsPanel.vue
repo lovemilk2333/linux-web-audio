@@ -90,7 +90,7 @@ const latency = computed(() => {
     {
       label: 'play buffer',
       value: `${buffer.toFixed(0)} ms`,
-      hint: 'audio queued and not yet heard; this is most of the delay',
+      hint: 'audio held and not yet heard, averaged over a packet; this is most of the delay',
     },
     {
       label: 'encode + decode + RTT/2 + buffer',

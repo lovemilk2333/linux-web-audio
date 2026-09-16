@@ -32,15 +32,18 @@ const DEFAULT_CHANNELS = 2
 /**
  * How much of the distance to the target is added to the debt each block.
  *
- * Tuned so the clock drift this machine measures — about 32 frames a second
- * between the capture source and the audio device — is held at roughly 92% of
- * the target, without the loop reacting hard enough to the level's ordinary
- * packet-rate swing to flutter.
+ * High, on purpose. The debt is what the reader pays out, so it is also the
+ * loop's gain: at the 0.008 this started at, holding the measured ~32 frames a
+ * second of clock drift needed the level to sit about 8% under the target at
+ * 100 ms — and 22% under it at 20 ms, because an integral loop's residual is
+ * proportional to the target, so the same gain that is fine for a long buffer
+ * is far too slow for a thin one. Measured at 0.08, the residual is under a
+ * millisecond at either size. Nothing else changed: the debt is still paid in
+ * whole samples, and still capped per block, so what reaches the ear is the
+ * same handful of repeats — they just arrive when the level actually slipped
+ * rather than seconds later.
  */
-const CORRECTION_GAIN = 0.008
-
-/** Extra weight while recovering from a real drain. See owe(). */
-const RECOVERY_MULTIPLIER = 4
+const CORRECTION_GAIN = 0.08
 
 /** Most single-sample corrections to spend in one render block (~3%). */
 const MAX_CORRECTIONS_PER_BLOCK = 4
@@ -48,11 +51,25 @@ const MAX_CORRECTIONS_PER_BLOCK = 4
 /**
  * Ceiling on the debt, in samples.
  *
- * Without it a long stall would leave corrections owed for minutes after the
- * buffer had already recovered, and the reader would keep repeating a sample
- * long past the point of it being the right thing to do.
+ * With a gain this high the debt saturates as soon as the level is meaningfully
+ * off, which is what makes recovery fast — but it also means the ceiling is
+ * what the reader pays back after the level has already recovered, so it sets
+ * the overshoot: 24 samples is half a millisecond. It doubles as the
+ * anti-windup for a buffer that has drained completely: without a ceiling, a
+ * long stall would leave corrections owed for minutes.
  */
-const MAX_OWED = 64
+const MAX_OWED = 24
+
+/**
+ * Time constant of the level filter, in seconds.
+ *
+ * The level is not smooth: five milliseconds of audio lands at once while
+ * playback drains continuously, so the raw queue sawtooths by a whole packet.
+ * Feeding that to the controller makes it react to the sawtooth instead of to
+ * the level — which is what forced the gain to be so low before. Filtering over
+ * roughly two packets leaves the mean, which is the thing worth controlling.
+ */
+const LEVEL_TAU = 0.01
 
 class PlayerProcessor extends AudioWorkletProcessor {
   constructor(options) {
@@ -106,6 +123,16 @@ class PlayerProcessor extends AudioWorkletProcessor {
     this.offset = 0
     /** Frames queued and not yet played. */
     this.buffered = 0
+
+    /**
+     * The same level, filtered. See LEVEL_TAU.
+     *
+     * This is what the controller steers and what the panel shows. The raw
+     * queue is a sawtooth — five milliseconds of audio arrives at once and
+     * drains continuously — and neither the reader nor the person watching
+     * wants to see that; both want the level underneath it.
+     */
+    this.level = 0
 
     /**
      * Playback gain, as a linear multiplier.
@@ -177,6 +204,7 @@ class PlayerProcessor extends AudioWorkletProcessor {
         this.queue = []
         this.offset = 0
         this.buffered = 0
+        this.level = 0
         this.playing = false
         this.looping = false
         this.correction = 0
@@ -185,6 +213,7 @@ class PlayerProcessor extends AudioWorkletProcessor {
         this.queue = []
         this.offset = 0
         this.buffered = 0
+        this.level = 0
         this.underruns = 0
         this.droppedFrames = 0
         this.playedFrames = 0
@@ -274,26 +303,18 @@ class PlayerProcessor extends AudioWorkletProcessor {
   /**
    * Adds this block's distance to the target to the debt.
    *
-   * The error is integrated rather than acted on directly, because the level
-   * is not smooth: packets arrive in bursts while playback drains
-   * continuously, so a 20 ms buffer swings several milliseconds with every
-   * one of them. Reacting to that swing is what a warble is. Only its average
-   * should move the reader.
+   * The error is integrated rather than acted on directly: the debt is what
+   * carries a correction forward once the level has moved, which is what lets
+   * a persistent shortfall — a clock that runs slow, a buffer that drained —
+   * be corrected at all rather than merely opposed.
    *
-   * Below the shortfall line the weight goes up, so a buffer that actually
-   * drained refills in a fraction of a second instead of crawling back. That
-   * line is four render blocks under the target, kept within three quarters of
-   * it (which is the same line for any sane target — at 100 ms it is exactly
-   * the old rule) and above a quarter of it, so a target thinner than four
-   * blocks still has a recovery band. At the 20 ms default the line lands
-   * about 9 ms, under the ordinary packet swing, so ordinary jitter never
-   * reaches it.
+   * What it is measured against is the filtered level, not the raw queue, so
+   * the packet sawtooth does not drive it. What comes out is a debt in whole
+   * samples, paid by the reader one at a time.
    */
   owe(blockFrames) {
     const target = Math.max(1, this.targetFrames)
-    const shortfall = Math.max(target * 0.25, Math.min(target * 0.75, target - blockFrames * 4))
-    const gain = this.buffered < shortfall ? CORRECTION_GAIN * RECOVERY_MULTIPLIER : CORRECTION_GAIN
-    const owed = ((this.buffered - target) / target) * blockFrames * gain
+    const owed = ((this.level - target) / target) * blockFrames * CORRECTION_GAIN
     this.correction = Math.max(-MAX_OWED, Math.min(MAX_OWED, this.correction + owed))
   }
 
@@ -401,6 +422,9 @@ class PlayerProcessor extends AudioWorkletProcessor {
         return true
       }
       this.playing = true
+      // Start the filter on the level it will be tracking, rather than
+      // winding up from zero and reading as a shortfall.
+      this.level = this.buffered
     }
 
     this.owe(wanted)
@@ -480,6 +504,17 @@ class PlayerProcessor extends AudioWorkletProcessor {
        * turn this hole into a whole target of silence. */
     }
 
+    /* Fold this block into the level estimate.
+     *
+     * Taken at the end of the block, plus half a block of what was consumed
+     * during it, so the sample describes the middle of the block rather than
+     * whichever end it was taken from. Steering on an end-of-block sample
+     * instead would hold the level half a block below the target — a bias the
+     * controller cannot see and so cannot correct. */
+    const sampled = this.buffered + wanted / 2
+    const alpha = Math.min(1, wanted / (LEVEL_TAU * this.sampleRate))
+    this.level += (sampled - this.level) * alpha
+
     this.peak = Math.max(this.peak, peak)
     this.silent = peak === 0
     this.report(wanted)
@@ -500,7 +535,10 @@ class PlayerProcessor extends AudioWorkletProcessor {
     this.port.postMessage({
       type: 'status',
       buffered: this.buffered,
-      bufferedMs: (this.buffered / this.sampleRate) * 1000,
+      /* The filtered level while playing, so the number does not jump with
+       * every packet; the raw queue during preroll, before the filter has
+       * anything to track. */
+      bufferedMs: ((this.playing ? this.level : this.buffered) / this.sampleRate) * 1000,
       underruns: this.underruns,
       droppedFrames: this.droppedFrames,
       playedFrames: this.playedFrames,

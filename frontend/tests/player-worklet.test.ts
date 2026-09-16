@@ -28,6 +28,8 @@ interface WorkletProcessor {
   idle: boolean
   playing: boolean
   buffered: number
+  /** The filtered level the reader steers on, and the panel shows. */
+  level: number
   correction: number
   refills: number
   underruns: number
@@ -70,7 +72,10 @@ function processor(targetMs: number, options: Record<string, unknown> = {}): Wor
  */
 class Source {
   readonly output: number[] = []
+  /** The raw queue level, once per render block: a sawtooth by one packet. */
   readonly levels: number[] = []
+  /** The filtered level, which is what the reader steers on. */
+  readonly shown: number[] = []
   private virtual = 0
   private next = 0
   private value = 0
@@ -100,6 +105,7 @@ class Source {
 
       for (const sample of out) this.output.push(sample)
       this.levels.push(this.p.buffered)
+      this.shown.push(this.p.level)
     }
   }
 
@@ -182,11 +188,20 @@ describe('playback worklet', () => {
     const corrections = reading.repeated + reading.skipped
     expect(corrections / source.output.length).toBeLessThan(0.005)
 
-    // And it is steered to the target: the level sits within a packet of it.
+    // And it is steered *to* the target, not merely below it: the level the
+    // reader holds is the target, within a fraction of a millisecond. An
+    // integral loop with too little gain settles short of the setpoint instead
+    // — measured, 78% of a 20 ms target, which is what this pins down.
     const target = Math.round((20 * RATE) / 1000)
-    const settled = source.levels.slice(Math.floor(source.levels.length / 2))
-    expect(Math.min(...settled)).toBeGreaterThan(target - 2 * FRAME)
-    expect(Math.max(...settled)).toBeLessThanOrEqual(target + FRAME)
+    const settled = source.shown.slice(Math.floor(source.shown.length / 2))
+    expect(mean(settled)).toBeGreaterThan(target - 0.5 * (RATE / 1000))
+    expect(mean(settled)).toBeLessThan(target + 0.5 * (RATE / 1000))
+
+    // The queue underneath still sawtooths, because audio arrives in packets —
+    // but around the target, not below it.
+    const queue = source.levels.slice(Math.floor(source.levels.length / 2))
+    expect(Math.max(...queue)).toBeLessThanOrEqual(target + FRAME)
+    expect(Math.min(...queue)).toBeGreaterThan(target - 2 * FRAME)
   })
 
   // The measured clock mismatch on the development machine: the source's clock
@@ -203,10 +218,12 @@ describe('playback worklet', () => {
 
     // 30 ppm is about 32 frames a second. Over eight seconds that is 256
     // frames — a quarter of the buffer — which the reader has to give back in
-    // repeated samples. It must not let the level go instead.
+    // repeated samples. It must not let the level go instead: the level stays
+    // on the target, and the drift shows up as repeats and nothing else.
     const target = Math.round((20 * RATE) / 1000)
-    const after = mean(source.levels.slice(-100))
-    expect(after).toBeGreaterThan(target - 3 * FRAME)
+    const after = mean(source.shown.slice(-100))
+    expect(after).toBeGreaterThan(target - 0.5 * (RATE / 1000))
+    expect(after).toBeLessThan(target + 0.5 * (RATE / 1000))
     expect(read(source.output).repeated, 'samples held back').toBeGreaterThan(100)
   })
 
