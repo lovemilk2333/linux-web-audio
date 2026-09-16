@@ -12,8 +12,10 @@ import workletUrl from './player-worklet.js?url'
 
 /** The playback buffer's own view of the world, reported from the audio thread. */
 export interface PlayerStatus {
-  /** Audio queued and not yet played, in milliseconds. */
+  /** Audio queued and not yet played, in milliseconds (filtered; see the worklet). */
   bufferedMs: number
+  /** The same queue, raw: frames queued and not yet played. */
+  bufferedFrames: number
   /** Times the buffer ran dry. */
   underruns: number
   /** Frames discarded to keep latency bounded. */
@@ -53,6 +55,7 @@ export interface PlayerStatus {
 
 const IDLE_STATUS: PlayerStatus = {
   bufferedMs: 0,
+  bufferedFrames: 0,
   underruns: 0,
   droppedFrames: 0,
   peak: 0,
@@ -165,6 +168,7 @@ export class Player {
       }
       this.status = {
         bufferedMs: message.bufferedMs,
+        bufferedFrames: message.buffered ?? 0,
         underruns: message.underruns,
         droppedFrames: message.droppedFrames,
         peak: message.peak,

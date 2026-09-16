@@ -168,7 +168,7 @@ what this page can measure.
 **Loop on underrun** is off by default. When it is on, a drained buffer is filled
 from about 40 ms of what just played instead of silence — a stutter rather than
 a click. The page sends the buffer target as `?buffer_ms` so the server can
-prefill that much history at 2× and pace a backlog against it.
+prefill that much history on a live join, and to refill it after a jump.
 
 **The token is not saved.** It is held in memory for the session and retyped
 after a reload. `localStorage` is readable by any script on the origin, so one

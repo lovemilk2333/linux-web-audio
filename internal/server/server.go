@@ -341,36 +341,27 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request, sub *hub
 // writePackets frames each hub packet and hands it to send, until the
 // subscriber ends or send fails.
 //
-// Live packets wait on capture, which is already 1×. A backlog — resume
-// catchup, a live-join prefill, or a queue that built up — is paced at 2×
-// the frame rate until it is 5 ms ahead, then 1.25× until it reaches the
-// client's play buffer, then 0.75× so the buffer cannot grow without bound.
+// Nothing here is paced. A live packet waits on capture, which is already one
+// per frame period, and a backlog — a resume's replay, a live-join prefill —
+// goes out as fast as the connection takes it. Pacing a backlog was tried and
+// removed: holding it to twice realtime stretched a resume's replay of 302
+// packets to three quarters of a second, during which the capture kept adding
+// live packets to the subscriber's 64-packet queue until it overflowed. An
+// overflow is a FastForward, so the pacing meant to fill the client's buffer
+// instead threw 192 packets of it away. The client is what bounds its own
+// latency: it trims, and it only decodes as much of a replay as it asked to
+// hold.
 func (s *Server) writePackets(ctx context.Context, sub *hub.Subscriber, buffer time.Duration, send func([]byte) error) {
 	stats := s.cfg.Hub.Stats()
 	frame := time.Duration(stats.FrameDurationMS * float64(time.Millisecond))
-	pacer := hub.SendPacer{Frame: frame, Buffer: buffer}
 
 	// A live join has no catchup. Prefill one play-buffer of history so
-	// the first packets go out at 2× instead of waiting a whole target
-	// at 1×.
+	// the client has something to start on.
 	s.prefillRecent(sub, buffer, frame, false)
 
 	buf := make([]byte, 0, proto.HeaderSize+2048)
 	sent := 0
-	var nextAt time.Time
 	for {
-		if !nextAt.IsZero() {
-			if wait := time.Until(nextAt); wait > 0 {
-				timer := time.NewTimer(wait)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					return
-				case <-timer.C:
-				}
-			}
-		}
-
 		pkt, err := sub.Next(ctx)
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, ctx.Err()) {
@@ -381,17 +372,16 @@ func (s *Server) writePackets(ctx context.Context, sub *hub.Subscriber, buffer t
 
 		// FastForward (and a capture reopen) leave a hole. Live 1×
 		// cannot refill the play buffer. Queue a target of history
-		// *before* this packet so the client hears it in order, then
-		// send at 2×. Catchup already went through this path; prefill
-		// again would loop. The dequeued packet is in Recent, so it
-		// is not sent here. History does not store the FastForward
-		// flag, so the first refill packet is marked discontinuous.
+		// *before* this packet so the client hears it in order. Catchup
+		// already went through this path; prefill again would loop. The
+		// dequeued packet is in Recent, so it is not sent here. History
+		// does not store the FastForward flag, so the first refill
+		// packet is marked discontinuous.
 		if pkt.Flags&proto.FlagDiscontinuity != 0 &&
 			pkt.Flags&proto.FlagCatchup == 0 &&
 			sub.Backlog() == 0 &&
 			buffer > 0 && frame > 0 {
 			if s.prefillRecent(sub, buffer, frame, true) {
-				pacer.Reset()
 				continue
 			}
 		}
@@ -406,17 +396,6 @@ func (s *Server) writePackets(ctx context.Context, sub *hub.Subscriber, buffer t
 			return
 		}
 		sent++
-
-		now := time.Now()
-		interval := pacer.ObserveSend(now)
-		if sub.Backlog() > 0 {
-			nextAt = now.Add(interval)
-		} else {
-			// Capture already spaces live packets. Sleeping here would
-			// only make the subscriber queue grow.
-			pacer.Reset()
-			nextAt = time.Time{}
-		}
 	}
 }
 

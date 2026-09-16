@@ -39,7 +39,16 @@ interface PageState {
     lastSeq: number | null
     summary: () => { ratio: number; packetsPerSecond: number }
   }
-  player: { playing: boolean; underruns: number; bufferedMs: number; playedMs: number }
+  player: {
+    playing: boolean
+    underruns: number
+    bufferedMs: number
+    /** The queue behind that figure, in frames. */
+    bufferedFrames: number
+    /** Frames discarded to bound latency. */
+    droppedFrames: number
+    playedMs: number
+  }
   events: { kind: string; message: string; missing?: number }[]
   error: string | null
   /** The buffer target in force, in milliseconds. */
@@ -180,5 +189,39 @@ test.describe('playback', () => {
 
     const resumed = after.events.find((event) => event.message.startsWith('resumed at seq'))
     expect(resumed, `no resume event: ${after.events.map((e) => e.message).join(' | ')}`).toBeTruthy()
+  })
+
+  /* The one thing a live stream cannot do is arrive at exactly the rate the
+   * audio device consumes it, so the reader is always either holding samples
+   * back or skipping them. What it must not do is trim — discarding a packet
+   * to take latency back off — because the hole that leaves looks exactly
+   * like a shortfall, and the reader fills it straight back in. Measured with
+   * the margin that allowed it: a packet dropped every 300 ms for the whole
+   * run, heard as the audio stumbling. */
+  test('holds the buffer without discarding audio', async ({ page }) => {
+    await page.goto('/')
+    await connect(page)
+    await waitForPlayback(page, 2)
+
+    // Counted from here: joining trims the server's prefill down to the
+    // target, deliberately, and before any of it has been heard.
+    const start = await state(page)
+
+    const levels: number[] = []
+    for (let i = 0; i < 12; i++) {
+      await page.waitForTimeout(500)
+      levels.push((await state(page)).player.bufferedFrames)
+    }
+
+    const current = await state(page)
+    const targetFrames = (current.targetMs / 1000) * (current.info?.sample_rate ?? 48000)
+
+    expect(current.player.droppedFrames - start.player.droppedFrames, 'frames discarded while playing').toBe(0)
+    expect(current.player.underruns - start.player.underruns, 'dropouts while playing').toBe(0)
+
+    // The level sawtooths by a packet, because that is how audio arrives, so
+    // the bounds are the target plus or minus that swing — not a hair.
+    expect(Math.min(...levels), 'level fell away from the target').toBeGreaterThan(targetFrames * 0.5)
+    expect(Math.max(...levels), 'level ran away from the target').toBeLessThan(targetFrames * 1.75)
   })
 })

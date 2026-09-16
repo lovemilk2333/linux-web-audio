@@ -75,8 +75,8 @@ export interface StreamOptions {
   resumeFrom?: number | null
   /**
    * The play-buffer target, in milliseconds. Sent as `buffer_ms` so the
-   * server can prefill that much history at 2× and drop to 0.75× once the
-   * lead reaches it. Omit to join at the live edge with no prefill.
+   * server can prefill that much history on a live join, and refill it after
+   * a discontinuity. Omit to join at the live edge with no prefill.
    */
   bufferMs?: number
   onFrame: (frame: Frame) => void

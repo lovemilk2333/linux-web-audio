@@ -236,12 +236,24 @@ class PlayerProcessor extends AudioWorkletProcessor {
    * Changes how much audio to hold.
    *
    * The setpoint the debt is measured against. Lowering it discards the extra
-   * so latency actually falls; raising it leaves the reader owing repeats,
-   * which bring the level up without stopping playback.
+   * so the latency actually falls. Raising it is the interesting direction: a
+   * live source cannot fill a buffer while playback consumes it at the same
+   * rate, so the reader's whole-sample corrections are the only way — and they
+   * run at a few percent of playback, which is a sixteenth of a second per
+   * millisecond of buffer. Fine for nudge, hopeless for a jump, so a shortfall
+   * past a few milliseconds stops playback and lets the buffer build at the
+   * source's own rate instead: that is as fast as the audio can arrive.
    */
   setTarget(targetMs) {
     this.targetMs = targetMs
-    if (this.buffered > this.targetFrames) this.trimTo(this.targetFrames)
+
+    if (this.buffered > this.targetFrames) {
+      this.trimTo(this.targetFrames)
+      return
+    }
+    if (this.buffered < this.targetFrames - Math.round(this.sampleRate * 0.01)) {
+      this.playing = false
+    }
   }
 
   /** Frames left in the head chunk that have not been played yet. */
@@ -266,9 +278,18 @@ class PlayerProcessor extends AudioWorkletProcessor {
 
   /** Discards the oldest audio until no more than `limitFrames` remain. */
   trimTo(limitFrames) {
+    const before = this.buffered
     while (this.queue.length > 1 && this.buffered - this.headRemaining() >= limitFrames) {
       this.dropHead()
     }
+    if (this.buffered === before) return
+
+    /* A drop is deliberate — it is latency being taken back off, not audio
+     * that went missing. Without this the reader sees a hole it did not
+     * cause, owes itself repeats for it, and fills it straight back in: drop
+     * a packet, repeat a packet, for as long as the stream runs. */
+    this.level = this.buffered
+    this.correction = 0
   }
 
   enqueue(channels) {
@@ -282,21 +303,24 @@ class PlayerProcessor extends AudioWorkletProcessor {
   }
 
   /**
-   * Discards the oldest audio when the buffer exceeds the target by more than
-   * one chunk.
+   * Discards the oldest audio when the buffer is well over the target.
    *
-   * The allowance is one chunk, not a fixed span: chunks are what arrive, so
-   * any smaller allowance would trim on every packet. It deliberately does not
-   * scale with the target either — an absolute floor here meant a small target
-   * was never honoured, and the buffer would grow to the floor before anything
-   * was dropped, which is the opposite of what asking for low latency means.
+   * This is for a backlog — a resume replay, a prefill — and the margin has to
+   * clear the sawtooth, which swings by a whole packet however the reader
+   * plays. A margin of one packet puts the threshold on the peak of that
+   * swing, so ordinary jitter trips it. Measured with the margin that tight,
+   * against a 16 ms target: a packet dropped every 300 ms, and the reader
+   * repeating samples to replace each one, forever — 800 frames a second in
+   * both directions. Half the target, or one packet, whichever is more, is
+   * clear of the swing and still bounds latency.
    *
    * This is what keeps the audio current after a resume, when the server
    * replays the missed backlog in one burst: without it, the client would sit
    * behind by however long the connection was down.
    */
   trim(arrived) {
-    if (this.buffered <= this.targetFrames + arrived) return
+    const allowance = Math.max(arrived, Math.round(this.targetFrames / 2))
+    if (this.buffered <= this.targetFrames + allowance) return
     this.trimTo(this.targetFrames)
   }
 
@@ -479,6 +503,12 @@ class PlayerProcessor extends AudioWorkletProcessor {
     }
 
     if (written > 0) {
+      // What actually reached the output from the stream, repeats included.
+      // Counted here rather than in copyOut, which only sees the frames read
+      // off the queue and would miss a repeat — and the whole point of the
+      // counter is that played + dropped + queued accounts for everything
+      // enqueued.
+      this.playedFrames += written
       this.captureLoop(output, 0, written)
       this.looping = false
     }

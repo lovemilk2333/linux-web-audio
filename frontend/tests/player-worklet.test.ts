@@ -33,6 +33,7 @@ interface WorkletProcessor {
   correction: number
   refills: number
   underruns: number
+  droppedFrames: number
   loops: number
   port: { onmessage: (event: { data: unknown }) => void }
   process(inputs: unknown[], outputs: Float32Array[][]): boolean
@@ -225,6 +226,35 @@ describe('playback worklet', () => {
     expect(after).toBeGreaterThan(target - 0.5 * (RATE / 1000))
     expect(after).toBeLessThan(target + 0.5 * (RATE / 1000))
     expect(read(source.output).repeated, 'samples held back').toBeGreaterThan(100)
+  })
+
+  // A source that runs slightly fast pushes the level up, and the reader has
+  // to hold it down by skipping samples. It must not take the other road and
+  // trim: a drop is not audio that went missing, and the reader would owe
+  // itself repeats for it, filling back what was just discarded. Measured
+  // with the trim margin set to one packet, against the 20 ms target this
+  // runs at: 800 frames a second dropped and 800 repeated, for as long as the
+  // stream ran — the audio stumbling, which is what it sounds like.
+  it('holds a fast source by skipping, and never trims to do it', () => {
+    const p = processor(20)
+    const source = new Source(p, -0.006)
+    source.run(8)
+
+    expect(p.droppedFrames, 'audio discarded').toBe(0)
+    expect(p.underruns, 'dropouts').toBe(0)
+    expect(read(source.output).invented).toBe(0)
+
+    // The level settles a little *above* the target, not below it: holding a
+    // source back costs a steady error in the direction of the correction —
+    // 0.6% of playback is about 73 frames at this gain — and the reader
+    // spends it above the setpoint, where the only cost is a millisecond and
+    // a half of latency.
+    const target = Math.round((20 * RATE) / 1000)
+    const after = mean(source.shown.slice(-100))
+    expect(after).toBeGreaterThan(target - 0.5 * (RATE / 1000))
+    expect(after).toBeLessThan(target + 2.5 * (RATE / 1000))
+    // Held back by whole samples, in the direction the level went.
+    expect(read(source.output).skipped, 'samples skipped').toBeGreaterThan(100)
   })
 
   // A stall empties the buffer. The old reader stopped and rebuilt, which

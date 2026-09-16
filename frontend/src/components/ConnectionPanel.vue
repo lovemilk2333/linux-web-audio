@@ -92,7 +92,7 @@ const warning = computed(() => {
 
     <div class="fields">
       <div class="field grow">
-        <label for="url">Server <span class="optional">blank uses this origin</span></label>
+        <label for="url">Server <span class="optional">blank uses current origin</span></label>
         <input
           id="url"
           :value="baseUrl"

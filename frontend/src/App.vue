@@ -79,7 +79,7 @@ const settings = reactive<Settings>(loadSettings())
 
 /* Deliberately not part of `settings` and never written to storage.
  *
- * A bearer token in localStorage is readable by any script on this origin —
+ * A bearer token in localStorage is readable by any script on current origin —
  * one XSS, or a malicious extension, and the secret protecting a live feed of
  * everything this machine plays is gone. It is retyped after a reload, which is
  * the cost of not leaving it lying around. */
@@ -118,6 +118,7 @@ const gainDb = computed({
 
 const playerStatus = reactive<PlayerStatus>({
   bufferedMs: 0,
+  bufferedFrames: 0,
   underruns: 0,
   droppedFrames: 0,
   peak: 0,
